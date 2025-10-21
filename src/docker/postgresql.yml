@@ -1,0 +1,12 @@
+name: calculadora_acv_postgresql
+services:
+  calculadora_acv_postgresql:
+    container_name: calculadora_acv_postgresql
+    image: postgres:15.5
+    environment:
+      - POSTGRES_USER=calculadora_user
+      - POSTGRES_PASSWORD=calculadora_password
+      - POSTGRES_DB=calculadora_acv
+      - POSTGRES_HOST_AUTH_METHOD=trust
+    ports:
+      - 127.0.0.1:55433:5432
