@@ -3,9 +3,9 @@ spring:
     name: calculadoraacv
 
   datasource:
-    url: jdbc:postgresql://10.139.78.47:5432/dbdes_13698_calcacv
-    username: usr_calcacv_des
-    password: fKdvYJLjhqVuoAOQlgZPgVEXktijoer
+    url: jdbc:postgresql://localhost:55433/calculadora_acv
+    username: calculadora_user
+    password: calculadora_password
     driver-class-name: org.postgresql.Driver
     hikari:
       maximum-pool-size: 20

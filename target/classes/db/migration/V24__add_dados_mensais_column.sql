@@ -1,1 +1,0 @@
-ALTER TABLE energia_dados ADD COLUMN dados_mensais TEXT;

@@ -1178,6 +1178,19 @@ public class MutService {
                             String.format("Já existe fator Solo para %s / %s → %s neste escopo.",
                                           ds.getTipoFatorSolo(), usoAnterior, usoAtual));
                     }
+                    // ✅ Validação adicional por escopo para campos independentes (LAC/arenoso/referência/fator)
+                    long countIndep = contarDuplicidadeSoloIndependente(
+                        fatorMut.getEscopo(),
+                        ds.getValorFator(),
+                        ds.getFatorCO2(),
+                        ds.getFatorCH4(),
+                        safe(ds.getDescricao()),
+                        fatorMut.getId()
+                    );
+                    if (countIndep > 0) {
+                        throw new DuplicacaoRegistroException(
+                            "Valores de Solo (LAC/arenoso/referência/fator de emissão) já existem neste escopo.");
+                    }
                 }
             }
             case DESMATAMENTO -> {
@@ -1203,6 +1216,19 @@ public class MutService {
                             }
                         }
                     }
+                    // ✅ Validação adicional por escopo para valores independentes (fitofisionomia/sigla/categoria/estoque)
+                    long countIndep = contarDuplicidadeDesmatamentoIndependente(
+                        fatorMut.getEscopo(),
+                        safe(dd.getNomeFitofisionomia()),
+                        dd.getSiglaFitofisionomia(),
+                        dd.getCategoriaDesmatamento(),
+                        dd.getEstoqueCarbono(),
+                        fatorMut.getId()
+                    );
+                    if (countIndep > 0) {
+                        throw new DuplicacaoRegistroException(
+                            "Valores de Desmatamento (fitofisionomia/sigla/categoria/estoque) já existem neste escopo.");
+                    }
                 }
             }
             case VEGETACAO -> {
@@ -1218,10 +1244,77 @@ public class MutService {
                             throw new DuplicacaoRegistroException(
                                 String.format("Já existe fator de Vegetação para %s / %s neste escopo.", cat, parametro));
                         }
+                        // ✅ Validação por escopo: categoria + parâmetro não pode duplicar
+                        long countIndep = contarDuplicidadeVegetacaoReplicativa(
+                            fatorMut.getEscopo(),
+                            cat,
+                            parametro.trim(),
+                            fatorMut.getId()
+                        );
+                        if (countIndep > 0) {
+                            throw new DuplicacaoRegistroException(
+                                "Categoria da fitofisionomia + Parâmetro já existem neste escopo.");
+                        }
                     }
                 }
             }
         }
+    }
+
+    // Helpers JPQL de contagem por escopo
+    private long contarDuplicidadeSoloIndependente(EscopoEnum escopo, BigDecimal valorFator,
+                                                   BigDecimal fatorCO2, BigDecimal fatorCH4,
+                                                   String descricao, Long excluirFatorId) {
+        String jpql = "SELECT COUNT(ds) FROM DadosSolo ds " +
+                      "WHERE ds.fatorMut.escopo = :escopo AND ds.fatorMut.ativo = true " +
+                      (excluirFatorId != null ? "AND ds.fatorMut.id <> :excluirId " : "") +
+                      "AND COALESCE(ds.valorFator, 0) = COALESCE(:valorFator, 0) " +
+                      "AND COALESCE(ds.fatorCO2, 0) = COALESCE(:fatorCO2, 0) " +
+                      "AND COALESCE(ds.fatorCH4, 0) = COALESCE(:fatorCH4, 0) " +
+                      "AND COALESCE(ds.descricao, '') = COALESCE(:descricao, '')";
+        var q = entityManager.createQuery(jpql, Long.class)
+            .setParameter("escopo", escopo)
+            .setParameter("valorFator", valorFator)
+            .setParameter("fatorCO2", fatorCO2)
+            .setParameter("fatorCH4", fatorCH4)
+            .setParameter("descricao", descricao);
+        if (excluirFatorId != null) q.setParameter("excluirId", excluirFatorId);
+        return q.getSingleResult();
+    }
+
+    private long contarDuplicidadeDesmatamentoIndependente(EscopoEnum escopo, String nome,
+                                                           SiglaFitofisionomia sigla,
+                                                           CategoriaDesmatamento categoria,
+                                                           BigDecimal estoque, Long excluirFatorId) {
+        String jpql = "SELECT COUNT(dd) FROM DadosDesmatamento dd " +
+                      "WHERE dd.fatorMut.escopo = :escopo AND dd.fatorMut.ativo = true " +
+                      (excluirFatorId != null ? "AND dd.fatorMut.id <> :excluirId " : "") +
+                      "AND COALESCE(dd.nomeFitofisionomia, '') = COALESCE(:nome, '') " +
+                      "AND dd.siglaFitofisionomia = :sigla " +
+                      "AND dd.categoriaDesmatamento = :categoria " +
+                      "AND COALESCE(dd.estoqueCarbono, 0) = COALESCE(:estoque, 0)";
+        var q = entityManager.createQuery(jpql, Long.class)
+            .setParameter("escopo", escopo)
+            .setParameter("nome", nome)
+            .setParameter("sigla", sigla)
+            .setParameter("categoria", categoria)
+            .setParameter("estoque", estoque);
+        if (excluirFatorId != null) q.setParameter("excluirId", excluirFatorId);
+        return q.getSingleResult();
+    }
+
+    private long contarDuplicidadeVegetacaoReplicativa(EscopoEnum escopo, CategoriaDesmatamento categoria,
+                                                       String parametro, Long excluirFatorId) {
+        String jpql = "SELECT COUNT(dv) FROM DadosVegetacao dv JOIN dv.categoriasFitofisionomia cat " +
+                      "WHERE dv.fatorMut.escopo = :escopo AND dv.fatorMut.ativo = true " +
+                      (excluirFatorId != null ? "AND dv.fatorMut.id <> :excluirId " : "") +
+                      "AND cat = :categoria AND dv.parametro = :parametro";
+        var q = entityManager.createQuery(jpql, Long.class)
+            .setParameter("escopo", escopo)
+            .setParameter("categoria", categoria)
+            .setParameter("parametro", parametro);
+        if (excluirFatorId != null) q.setParameter("excluirId", excluirFatorId);
+        return q.getSingleResult();
     }
 
     private String safe(String s) { return s == null ? "" : s.trim(); }

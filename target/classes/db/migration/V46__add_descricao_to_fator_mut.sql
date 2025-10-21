@@ -1,3 +1,0 @@
--- V46__add_descricao_to_fator_mut.sql
--- Esta migration está vazia para evitar erros
--- A funcionalidade foi movida para V53__add_descricao_to_fator_mut.sql
