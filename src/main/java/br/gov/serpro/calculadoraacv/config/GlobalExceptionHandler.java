@@ -49,8 +49,12 @@ public class GlobalExceptionHandler {
     // Exceções de duplicação
     @ExceptionHandler(DuplicacaoRegistroException.class)
     public ResponseEntity<ErrorResponse> handleDuplicacaoRegistro(DuplicacaoRegistroException ex) {
-        log.error("Tentativa de duplicação de registro: {} - Código: {}", ex.getMessage(), ex.getCodigo());
-        ErrorResponse error = new ErrorResponse(ex.getCodigo(), ex.getMessage());
+        // Preencher idExistente quando disponível
+        ErrorResponse error = ErrorResponse.builder()
+            .codigo(ex.getCodigo())
+            .mensagem(ex.getMessage())
+            .idExistente(ex.getIdExistente())
+            .build();
         return ResponseEntity.status(HttpStatus.CONFLICT).body(error);
     }
 

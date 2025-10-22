@@ -16,10 +16,9 @@ import br.gov.serpro.calculadoraacv.repository.FatorMutRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.poi.ss.usermodel.*;
-import org.apache.poi.xssf.usermodel.XSSFWorkbook;
-import org.apache.poi.xssf.usermodel.XSSFSheet;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
+import org.springframework.dao.DataIntegrityViolationException;
 
 import java.util.Set;
 import java.util.Map;
@@ -40,8 +39,8 @@ import java.time.LocalDateTime;
 import java.util.*;
 import java.util.function.Function;
 import java.util.stream.Collectors;
+import java.text.Normalizer;
 
-// Add EntityManager import
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.PersistenceContext;
 
@@ -51,8 +50,7 @@ import jakarta.persistence.PersistenceContext;
 public class MutService {
 
     private final FatorMutRepository fatorMutRepository;
-    
-    // Add EntityManager for direct SQL operations
+
     @PersistenceContext
     private EntityManager entityManager;
 
@@ -60,29 +58,31 @@ public class MutService {
     public MutResponse criar(MutRequest request, Usuario usuario) {
         validarDadosMut(request);
 
-        // First, check if there's a deleted record with the same combination that can be reactivated
+        // ===== Opção 1: bloquear duplicidade Solo pelo par usoAnterior/usoAtual e devolver idExistente no 409 =====
+        try {
+            verificarDuplicidadeSoloComIdExistente(request);
+        } catch (DuplicacaoRegistroException e) {
+            // Encaminha 409 imediatamente com detalhes (handler deve incluir idExistente no body)
+            throw e;
+        }
+
+        // Primeiro tenta reativar
         List<FatorMut> fatoresInativos = fatorMutRepository.findByTipoMudancaAndEscopoAndAtivoFalse(
-            request.getTipoMudanca(), request.getEscopo());
-        
+                request.getTipoMudanca(), request.getEscopo());
+
         FatorMut fatorMut;
         if (!fatoresInativos.isEmpty()) {
-            // Reactivate the most recent deleted record (first in the ordered list)
             fatorMut = fatoresInativos.get(0);
             fatorMut.setAtivo(true);
-            
-            // Use the proper method to clear data and force persistence
-            limparDadosEspecificos(fatorMut);
-            
+            limparDadosEspecificosSafe(fatorMut);
             processarDadosEspecificos(fatorMut, request);
-            // RN008B — valida unicidade somente após todos os campos da combinação
-            validarUnicidadeRN008(fatorMut);
+            validarUnicidadeRN008(fatorMut); // RN de duplicidade (ver regras por tipo)
         } else {
-            // Check if there's an active record with the same exact combination (tipo + escopo)
-            // This check is done here to handle race conditions
+            // Se já existir ativo com mesmo tipo+escopo, reaproveita
             if (verificarExistencia(request.getTipoMudanca(), request.getEscopo())) {
                 List<FatorMut> fatoresAtivos = fatorMutRepository
-                    .findAllByTipoMudancaAndEscopoAndAtivoTrueOrderByDataAtualizacaoDesc(
-                        request.getTipoMudanca(), request.getEscopo());
+                        .findAllByTipoMudancaAndEscopoAndAtivoTrueOrderByDataAtualizacaoDesc(
+                                request.getTipoMudanca(), request.getEscopo());
                 if (!fatoresAtivos.isEmpty()) {
                     FatorMut fatorAtivo = fatoresAtivos.get(0);
                     limparDadosEspecificosSafe(fatorAtivo);
@@ -109,77 +109,66 @@ public class MutService {
             }
         }
 
-        // Antes de salvar, garantir que dataAtualizacao está definida
-    fatorMut.setDataAtualizacao(LocalDateTime.now());
-    
-    fatorMut = fatorMutRepository.save(fatorMut);
-    return converterParaResponse(fatorMut);
+        fatorMut.setDataAtualizacao(LocalDateTime.now());
+        try {
+            fatorMut = fatorMutRepository.save(fatorMut);
+        } catch (Exception ex) {
+            // Tradução para 409 sem consultar o repositório nesta transação
+            if (isUniqueConstraintViolation(ex)) {
+                throw new DuplicacaoRegistroException(
+                    "DADOS_DUPLICADOS",
+                    "Dados duplicados detectados. Verifique se o registro já existe.",
+                    null // evitamos lookup aqui para não auto-flush; idExistente virá da pré-checagem
+                );
+            }
+            throw ex;
+        }
+        // Replicação automática dos campos comuns para o outro escopo (ESCOPO1 <-> ESCOPO3)
+        replicarCamposComunsParaOutroEscopo(fatorMut);
+        return converterParaResponse(fatorMut);
     }
 
     @Transactional
     public MutResponse atualizar(Long id, MutRequest request, Usuario usuario) {
-        log.info("=== INÍCIO DA ATUALIZAÇÃO MUT ID: {} ===", id);
-        log.debug("Dados recebidos - Tipo: {}, Escopo: {}", 
-                 request.getTipoMudanca(), request.getEscopo());
-        
+        log.info("=== INÍCIO ATUALIZAÇÃO MUT ID: {} ===", id);
         try {
             validarDadosMut(request);
-            log.debug("Validação dos dados concluída com sucesso");
 
             FatorMut fatorMut = fatorMutRepository.findByIdAndAtivoTrue(id)
-                    .orElseThrow(() -> {
-                        log.error("Fator MUT com ID {} não encontrado ou inativo", id);
-                        return new ValidacaoException("Fator MUT não encontrado");
-                    });
-            
-            log.debug("Fator MUT encontrado - Tipo atual: {}, Escopo atual: {}", 
-                     fatorMut.getTipoMudanca(), fatorMut.getEscopo());
+                    .orElseThrow(() -> new ValidacaoException("Fator MUT não encontrado"));
 
-            // Verifica se houve mudança nos dados identificadores
-            boolean dadosIdentificadoresAlterados = !fatorMut.getTipoMudanca().equals(request.getTipoMudanca()) ||
-                !fatorMut.getEscopo().equals(request.getEscopo());
-                
-            if (dadosIdentificadoresAlterados) {
-                log.debug("Dados identificadores alterados, verificando duplicatas");
-                if (fatorMutRepository.existsByTipoMudancaAndEscopoAndAtivoTrueAndIdNot(
-                        request.getTipoMudanca(), request.getEscopo(), id)) {
-                    log.error("Tentativa de criar duplicata - Tipo: {}, Escopo: {}", 
-                             request.getTipoMudanca(), request.getEscopo());
-                    throw new ValidacaoException("Já existe um fator MUT com este tipo e escopo");
-                }
+            boolean dadosIdentificadoresAlterados =
+                    !fatorMut.getTipoMudanca().equals(request.getTipoMudanca()) ||
+                    !fatorMut.getEscopo().equals(request.getEscopo());
+
+            if (dadosIdentificadoresAlterados &&
+                    fatorMutRepository.existsByTipoMudancaAndEscopoAndAtivoTrueAndIdNot(
+                            request.getTipoMudanca(), request.getEscopo(), id)) {
+                throw new ValidacaoException("Já existe um fator MUT com este tipo e escopo");
             }
 
-            // Atualiza dados básicos
+            // Atualiza chaves de identificação
             fatorMut.setTipoMudanca(request.getTipoMudanca());
             fatorMut.setEscopo(request.getEscopo());
-            log.debug("Dados básicos atualizados");
 
-            // ✅ CORREÇÃO: Limpar dados específicos de forma mais segura
-            log.debug("Iniciando limpeza de dados específicos");
             limparDadosEspecificosSafe(fatorMut);
-            log.debug("Limpeza de dados específicos concluída");
-            
-            // Processa novos dados específicos
-            log.debug("Iniciando processamento de novos dados específicos");
             processarDadosEspecificos(fatorMut, request);
-            // RN008B — valida unicidade somente após todos os campos da combinação
-            validarUnicidadeRN008(fatorMut);
-            log.debug("Processamento de novos dados específicos concluído");
 
-            // Antes de salvar, garantir que dataAtualizacao está definida
+            // RN008 — duplicidade por escopo dos INDEPENDENTES
+            validarUnicidadeRN008(fatorMut);
+
             fatorMut.setDataAtualizacao(LocalDateTime.now());
-            
-            // ✅ CORREÇÃO: Salvar e fazer flush para garantir persistência
             fatorMut = fatorMutRepository.saveAndFlush(fatorMut);
-            log.info("Fator MUT ID {} atualizado com sucesso", id);
-            
+            log.info("Fator MUT ID {} atualizado", id);
+            // Replicação automática dos campos comuns para o outro escopo (ESCOPO1 <-> ESCOPO3)
+            replicarCamposComunsParaOutroEscopo(fatorMut);
             return converterParaResponse(fatorMut);
-            
+
         } catch (ValidacaoException e) {
-            log.error("Erro de validação ao atualizar MUT ID {}: {}", id, e.getMessage());
+            log.error("Validação falhou ao atualizar MUT {}: {}", id, e.getMessage());
             throw e;
         } catch (Exception e) {
-            log.error("Erro inesperado ao atualizar MUT ID {}: {}", id, e.getMessage(), e);
+            log.error("Erro inesperado ao atualizar MUT {}: {}", id, e.getMessage(), e);
             throw new ValidacaoException("Erro interno ao atualizar fator MUT: " + e.getMessage());
         }
     }
@@ -207,63 +196,46 @@ public class MutService {
                 Sort.Direction.fromString(filtros.getDirection()),
                 filtros.getSort());
 
-        // Always filter by ativo=true unless explicitly set to false
         Boolean ativo = filtros.getAtivo() != null ? filtros.getAtivo() : true;
-        
-        // ✅ NOVO: Usar termoBusca se fornecido, senão usar nome
-        String termoBusca = filtros.getTermoBusca() != null && !filtros.getTermoBusca().trim().isEmpty() 
-            ? "%" + filtros.getTermoBusca().trim() + "%" 
-            : (filtros.getNome() != null && !filtros.getNome().trim().isEmpty() 
-                ? "%" + filtros.getNome().trim() + "%" 
+
+        String termoBusca = filtros.getTermoBusca() != null && !filtros.getTermoBusca().trim().isEmpty()
+                ? "%" + filtros.getTermoBusca().trim() + "%"
+                : (filtros.getNome() != null && !filtros.getNome().trim().isEmpty()
+                ? "%" + filtros.getNome().trim() + "%"
                 : null);
 
-        // ✅ CORREÇÃO: Usar query sem FETCH para paginação e ordenação
         Page<FatorMut> fatores = fatorMutRepository.findWithFiltersOnly(
                 filtros.getTipoMudanca(),
                 filtros.getEscopo(),
                 ativo,
-                filtros.getBiomas() != null && !filtros.getBiomas().isEmpty() ? 
-                    filtros.getBiomas().iterator().next() : null,
+                filtros.getBiomas() != null && !filtros.getBiomas().isEmpty()
+                        ? filtros.getBiomas().iterator().next()
+                        : null,
                 termoBusca,
                 pageable);
 
-        // ✅ CORREÇÃO: Fazer FETCH separado das coleções
         if (fatores.hasContent()) {
-            List<Long> ids = fatores.getContent().stream()
-                    .map(FatorMut::getId)
-                    .collect(Collectors.toList());
-            
-            // Load vegetacao categories in separate query
+            List<Long> ids = fatores.getContent().stream().map(FatorMut::getId).collect(Collectors.toList());
+
             List<FatorMut> fatoresComVegetacao = fatorMutRepository.findWithVegetacaoCategories(ids);
             Map<Long, FatorMut> vegetacaoMap = fatoresComVegetacao.stream()
                     .collect(Collectors.toMap(FatorMut::getId, Function.identity()));
-            
-            // Load desmatamento and ufs in separate query
+
             List<FatorMut> fatoresComDesmatamento = fatorMutRepository.findWithDesmatamentoAndUfs(ids);
             Map<Long, FatorMut> desmatamentoMap = fatoresComDesmatamento.stream()
                     .collect(Collectors.toMap(FatorMut::getId, Function.identity()));
-            
-            // Load dados solo in separate query
+
             List<FatorMut> fatoresComSolo = fatorMutRepository.findWithDadosSolo(ids);
             Map<Long, FatorMut> soloMap = fatoresComSolo.stream()
                     .collect(Collectors.toMap(FatorMut::getId, Function.identity()));
-            
-            // Merge collections back into main entities
-            fatores.getContent().forEach(fator -> {
-                FatorMut fatorComVegetacao = vegetacaoMap.get(fator.getId());
-                if (fatorComVegetacao != null) {
-                    fator.setDadosVegetacao(fatorComVegetacao.getDadosVegetacao());
-                }
-                
-                FatorMut fatorComDesmatamento = desmatamentoMap.get(fator.getId());
-                if (fatorComDesmatamento != null) {
-                    fator.setDadosDesmatamento(fatorComDesmatamento.getDadosDesmatamento());
-                }
-                
-                FatorMut fatorComSolo = soloMap.get(fator.getId());
-                if (fatorComSolo != null) {
-                    fator.setDadosSolo(fatorComSolo.getDadosSolo());
-                }
+
+            fatores.getContent().forEach(f -> {
+                FatorMut v = vegetacaoMap.get(f.getId());
+                if (v != null) f.setDadosVegetacao(v.getDadosVegetacao());
+                FatorMut d = desmatamentoMap.get(f.getId());
+                if (d != null) f.setDadosDesmatamento(d.getDadosDesmatamento());
+                FatorMut s = soloMap.get(f.getId());
+                if (s != null) f.setDadosSolo(s.getDadosSolo());
             });
         }
 
@@ -287,22 +259,19 @@ public class MutService {
     public void importarExcel(MultipartFile arquivo) {
         log.info("=== INÍCIO DA IMPORTAÇÃO EXCEL ===");
 
-        if (arquivo.isEmpty()) {
-            throw new ValidacaoException("Arquivo não pode estar vazio");
-        }
-        
+        if (arquivo.isEmpty()) throw new ValidacaoException("Arquivo não pode estar vazio");
+
         String nomeArquivo = arquivo.getOriginalFilename();
         if (nomeArquivo == null || (!nomeArquivo.toLowerCase().endsWith(".xlsx") && !nomeArquivo.toLowerCase().endsWith(".xls"))) {
-            throw new ValidacaoException("Arquivo deve ser do tipo Excel (.xlsx ou .xls)");
+            throw new ValidacaoException("Arquivo deve ser .xlsx ou .xls");
         }
-        
         if (arquivo.getSize() > 10 * 1024 * 1024) {
-            throw new ValidacaoException("Arquivo muito grande. Tamanho máximo: 10MB");
+            throw new ValidacaoException("Arquivo muito grande. Máximo: 10MB");
         }
 
         try {
             processarArquivoExcelMultiplasAbas(arquivo);
-            log.info("=== IMPORTAÇÃO CONCLUÍDA COM SUCESSO ===");
+            log.info("=== IMPORTAÇÃO CONCLUÍDA ===");
         } catch (IOException e) {
             log.error("Erro ao processar arquivo Excel", e);
             throw new ValidacaoException("Erro ao processar arquivo Excel: " + e.getMessage());
@@ -311,100 +280,83 @@ public class MutService {
 
     private void processarArquivoExcelMultiplasAbas(MultipartFile arquivo) throws IOException {
         try (Workbook workbook = WorkbookFactory.create(arquivo.getInputStream())) {
-            
-            // Mapear abas esperadas conforme regras de negócio
             Map<String, TipoMudanca> abasEsperadas = Map.of(
-                "Base | Solo", TipoMudanca.SOLO,
-                "Base | Desmatamento", TipoMudanca.DESMATAMENTO,
-                "Base | Vegetação", TipoMudanca.VEGETACAO
+                    "Base | Solo", TipoMudanca.SOLO,
+                    "Base | Desmatamento", TipoMudanca.DESMATAMENTO,
+                    "Base | Vegetação", TipoMudanca.VEGETACAO
             );
-            
-            // Verificar se todas as abas obrigatórias existem
+
             Set<String> abasEncontradas = new HashSet<>();
             for (int i = 0; i < workbook.getNumberOfSheets(); i++) {
                 String nomeAba = workbook.getSheetAt(i).getSheetName();
-                if (abasEsperadas.containsKey(nomeAba)) {
-                    abasEncontradas.add(nomeAba);
-                }
+                if (abasEsperadas.containsKey(nomeAba)) abasEncontradas.add(nomeAba);
             }
-            
             if (abasEncontradas.size() != abasEsperadas.size()) {
-                Set<String> abasFaltantes = new HashSet<>(abasEsperadas.keySet());
-                abasFaltantes.removeAll(abasEncontradas);
-                throw new ValidacaoException("Abas obrigatórias não encontradas: " + String.join(", ", abasFaltantes));
+                Set<String> faltando = new HashSet<>(abasEsperadas.keySet());
+                faltando.removeAll(abasEncontradas);
+                throw new ValidacaoException("Abas obrigatórias não encontradas: " + String.join(", ", faltando));
             }
-            
-            // Processar cada aba
-            int totalLinhasProcessadas = 0;
+
+            int total = 0;
             for (Map.Entry<String, TipoMudanca> entry : abasEsperadas.entrySet()) {
-                String nomeAba = entry.getKey();
-                TipoMudanca tipoMudanca = entry.getValue();
-                
-                Sheet sheet = workbook.getSheet(nomeAba);
-                if (sheet == null) {
-                    throw new ValidacaoException("Aba não encontrada: " + nomeAba);
-                }
-                
-                log.info("Processando aba: {}", nomeAba);
-                int linhasAba = processarAba(sheet, tipoMudanca, nomeAba);
-                totalLinhasProcessadas += linhasAba;
-                log.info("Aba {} processada: {} linhas", nomeAba, linhasAba);
+                String aba = entry.getKey();
+                TipoMudanca tipo = entry.getValue();
+                Sheet sheet = workbook.getSheet(aba);
+                if (sheet == null) throw new ValidacaoException("Aba não encontrada: " + aba);
+                log.info("Processando aba: {}", aba);
+                int linhas = processarAba(sheet, tipo, aba);
+                total += linhas;
+                log.info("Aba {}: {} linhas", aba, linhas);
             }
-            
-            log.info("Total de linhas processadas: {}", totalLinhasProcessadas);
+            log.info("Total processado: {}", total);
         }
     }
 
     private int processarAba(Sheet sheet, TipoMudanca tipoMudanca, String nomeAba) {
         Row headerRow = sheet.getRow(0);
-        if (headerRow == null) {
-            throw new ValidacaoException("Aba " + nomeAba + " não possui cabeçalho");
-        }
+        if (headerRow == null) throw new ValidacaoException("Aba " + nomeAba + " não possui cabeçalho");
 
         validarCabecalhoEspecifico(headerRow, tipoMudanca, nomeAba);
 
-        int linhasProcessadas = 0;
+        int linhas = 0;
         for (int i = 1; i <= sheet.getLastRowNum(); i++) {
             Row row = sheet.getRow(i);
-            if (row == null || isRowEmpty(row)) {
-                continue;
-            }
-            
+            if (row == null || isRowEmpty(row)) continue;
+
             try {
                 switch (tipoMudanca) {
                     case SOLO -> processarLinhaSolo(row, i + 1, nomeAba);
                     case DESMATAMENTO -> processarLinhaDesmatamento(row, i + 1, nomeAba);
                     case VEGETACAO -> processarLinhaVegetacao(row, i + 1, nomeAba);
                 }
-                linhasProcessadas++;
+                linhas++;
             } catch (Exception e) {
-                log.error("Erro ao processar linha {} da aba {}: {}", i + 1, nomeAba, e.getMessage());
+                log.error("Erro na linha {} da aba {}: {}", i + 1, nomeAba, e.getMessage());
                 throw new ValidacaoException("Erro na linha " + (i + 1) + " da aba " + nomeAba + ": " + e.getMessage());
             }
         }
-        
-        return linhasProcessadas;
+        return linhas;
     }
 
     private void validarCabecalhoEspecifico(Row headerRow, TipoMudanca tipoMudanca, String nomeAba) {
         String[] cabecalhoEsperado = switch (tipoMudanca) {
             case SOLO -> new String[]{
-                "Nome", "Escopo", "Bioma", "Tipo Fator Solo", "Valor Fator", 
-                "Fator CO2", "Fator CH4", "Fator N2O", "Descrição"
+                    "Nome", "Escopo", "Bioma", "Tipo Fator Solo", "Valor Fator",
+                    "Fator CO2", "Fator CH4", "Fator N2O", "Descrição"
             };
             case DESMATAMENTO -> new String[]{
-                "Nome", "Escopo", "Bioma", "Nome Fitofisionomia", "Sigla Fitofisionomia", 
-                "Categoria Desmatamento", "UFs", "Estoque Carbono", "Fator CO2", "Fator CH4", "Fator N2O"
+                    "Nome", "Escopo", "Bioma", "Nome Fitofisionomia", "Sigla Fitofisionomia",
+                    "Categoria Desmatamento", "UFs", "Estoque Carbono", "Fator CO2", "Fator CH4", "Fator N2O"
             };
             case VEGETACAO -> new String[]{
-                "Nome", "Escopo", "Bioma", "Categorias Fitofisionomia", "Parâmetro", 
-                "Fator CO2", "Fator CH4", "Fator N2O"
+                    "Nome", "Escopo", "Bioma", "Categorias Fitofisionomia", "Parâmetro",
+                    "Fator CO2", "Fator CH4", "Fator N2O"
             };
         };
 
         List<String> cabecalhoRecebido = new ArrayList<>();
         int ultimaColuna = headerRow.getLastCellNum();
-        
+
         for (int i = 0; i < ultimaColuna; i++) {
             Cell cell = headerRow.getCell(i);
             String valor = getCellValueAsString(cell);
@@ -413,32 +365,27 @@ public class MutService {
 
         if (cabecalhoRecebido.size() != cabecalhoEsperado.length) {
             throw new ValidacaoException(
-                String.format("Aba %s: Número de colunas incorreto. Esperado: %d, Recebido: %d. Colunas esperadas: %s", 
-                             nomeAba, cabecalhoEsperado.length, cabecalhoRecebido.size(),
-                             String.join(", ", cabecalhoEsperado)));
+                    String.format("Aba %s: número de colunas incorreto. Esperado: %d, Recebido: %d. Esperado: %s",
+                            nomeAba, cabecalhoEsperado.length, cabecalhoRecebido.size(), String.join(", ", cabecalhoEsperado)));
         }
 
         for (int i = 0; i < cabecalhoEsperado.length; i++) {
             String esperado = cabecalhoEsperado[i];
             String recebido = cabecalhoRecebido.get(i);
-            
             if (recebido == null || recebido.trim().isEmpty()) {
                 throw new ValidacaoException(
-                    String.format("Aba %s: Coluna %d está vazia. Esperado: '%s'", nomeAba, i + 1, esperado));
+                        String.format("Aba %s: Coluna %d está vazia. Esperado: '%s'", nomeAba, i + 1, esperado));
             }
-            
             if (!esperado.equalsIgnoreCase(recebido.trim())) {
                 throw new ValidacaoException(
-                    String.format("Aba %s: Cabeçalho inválido na coluna %d. Esperado: '%s', Recebido: '%s'", 
-                                 nomeAba, i + 1, esperado, recebido));
+                        String.format("Aba %s: Cabeçalho inválido na coluna %d. Esperado: '%s', Recebido: '%s'",
+                                nomeAba, i + 1, esperado, recebido));
             }
         }
-        
-        log.info("Cabeçalho da aba {} validado com sucesso", nomeAba);
+        log.info("Cabeçalho da aba {} validado", nomeAba);
     }
 
     private void processarLinhaSolo(Row row, int numeroLinha, String nomeAba) {
-        // Extrai valores específicos para Solo
         String nome = getCellValueAsString(row.getCell(0));
         String escopoStr = getCellValueAsString(row.getCell(1));
         String biomaStr = getCellValueAsString(row.getCell(2));
@@ -449,32 +396,19 @@ public class MutService {
         BigDecimal fatorN2O = getCellValueAsBigDecimal(row.getCell(7));
         String descricao = getCellValueAsString(row.getCell(8));
 
-        // Validações obrigatórias
         validarCamposObrigatorios(nome, escopoStr, biomaStr, numeroLinha, nomeAba);
-        
+
         if (tipoFatorSoloStr == null || tipoFatorSoloStr.trim().isEmpty()) {
             throw new ValidacaoException("Tipo Fator Solo é obrigatório na linha " + numeroLinha + " da aba " + nomeAba);
         }
 
-        // Conversões
         EscopoEnum escopo = converterEscopo(escopoStr);
         Bioma bioma = converterBioma(biomaStr);
-        
-        // Log da conversão de valores simples
-        log.debug("Linha {}: Convertendo tipo fator solo '{}' (valor simples)", numeroLinha, tipoFatorSoloStr);
         TipoFatorSolo tipoFatorSolo = converterTipoFatorSolo(tipoFatorSoloStr);
 
-        // Verifica duplicatas
-        if (fatorMutRepository.existsByTipoMudancaAndEscopoAndAtivoTrue(TipoMudanca.SOLO, escopo)) {
-            throw new ValidacaoException(
-                String.format("Fator MUT Solo ativo já existe na linha %d da aba %s com Escopo: '%s'", 
-                             numeroLinha, nomeAba, escopo));
-        }
-
-        // Cria ou reativa fator MUT
+        // Não bloqueia a existência do FatorMut — reusa/cria
         FatorMut fatorMut = criarOuReativarFatorMut(TipoMudanca.SOLO, escopo, numeroLinha, nomeAba);
-        
-        // Cria dados específicos do Solo
+
         DadosSolo dadosSolo = new DadosSolo();
         dadosSolo.setBioma(bioma);
         dadosSolo.setTipoFatorSolo(tipoFatorSolo);
@@ -482,17 +416,17 @@ public class MutService {
         dadosSolo.setFatorCO2(fatorCO2 != null ? fatorCO2 : BigDecimal.ZERO);
         dadosSolo.setFatorCH4(fatorCH4 != null ? fatorCH4 : BigDecimal.ZERO);
         dadosSolo.setFatorN2O(fatorN2O != null ? fatorN2O : BigDecimal.ZERO);
+        // IMPORTANTE: descricao agora é só a referência (sem “A -> B”)
         dadosSolo.setDescricao(descricao != null ? descricao.trim() : "Importado via Excel");
         dadosSolo.setFatorMut(fatorMut);
-        
+
         fatorMut.setDadosSolo(List.of(dadosSolo));
         fatorMutRepository.save(fatorMut);
-        
-        log.debug("Linha {} da aba {} processada com sucesso: {}", numeroLinha, nomeAba, nome);
+
+        log.debug("Linha {} da aba {} processada (Solo): {}", numeroLinha, nomeAba, nome);
     }
 
     private void processarLinhaDesmatamento(Row row, int numeroLinha, String nomeAba) {
-        // Extrai valores específicos para Desmatamento
         String nome = getCellValueAsString(row.getCell(0));
         String escopoStr = getCellValueAsString(row.getCell(1));
         String biomaStr = getCellValueAsString(row.getCell(2));
@@ -505,56 +439,39 @@ public class MutService {
         BigDecimal fatorCH4 = getCellValueAsBigDecimal(row.getCell(9));
         BigDecimal fatorN2O = getCellValueAsBigDecimal(row.getCell(10));
 
-        // Validações obrigatórias
         validarCamposObrigatorios(nome, escopoStr, biomaStr, numeroLinha, nomeAba);
-        
         if (nomeFitofisionomia == null || nomeFitofisionomia.trim().isEmpty()) {
             throw new ValidacaoException("Nome Fitofisionomia é obrigatório na linha " + numeroLinha + " da aba " + nomeAba);
         }
 
-        // Conversões
         EscopoEnum escopo = converterEscopo(escopoStr);
         Bioma bioma = converterBioma(biomaStr);
         SiglaFitofisionomia siglaFitofisionomia = converterSiglaFitofisionomia(siglaFitofisionomiaStr);
         CategoriaDesmatamento categoriaDesmatamento = converterCategoriaDesmatamento(categoriaDesmatamentoStr);
-        
-        // Log da conversão de valores simples para array
-        log.debug("Linha {}: Convertendo UFs '{}' para array", numeroLinha, ufsStr);
         Set<UF> ufs = converterUfs(ufsStr);
-        log.debug("Linha {}: UFs convertidas: {}", numeroLinha, ufs);
 
-        // Verifica duplicatas
-        if (fatorMutRepository.existsByTipoMudancaAndEscopoAndAtivoTrue(TipoMudanca.DESMATAMENTO, escopo)) {
-            throw new ValidacaoException(
-                String.format("Fator MUT Desmatamento ativo já existe na linha %d da aba %s com Escopo: '%s'", 
-                             numeroLinha, nomeAba, escopo));
-        }
-
-        // Cria ou reativa fator MUT
         FatorMut fatorMut = criarOuReativarFatorMut(TipoMudanca.DESMATAMENTO, escopo, numeroLinha, nomeAba);
-        
-        // Cria dados específicos do Desmatamento
-        DadosDesmatamento dadosDesmatamento = new DadosDesmatamento();
-        dadosDesmatamento.setBioma(bioma);
-        dadosDesmatamento.setNomeFitofisionomia(nomeFitofisionomia.trim());
-        dadosDesmatamento.setSiglaFitofisionomia(siglaFitofisionomia);
-        dadosDesmatamento.setCategoriaDesmatamento(categoriaDesmatamento);
-        dadosDesmatamento.setUfs(ufs);
-        dadosDesmatamento.setEstoqueCarbono(estoqueCarbono != null ? estoqueCarbono : BigDecimal.ZERO);
-        dadosDesmatamento.setFatorCO2(fatorCO2 != null ? fatorCO2 : BigDecimal.ZERO);
-        dadosDesmatamento.setFatorCH4(fatorCH4 != null ? fatorCH4 : BigDecimal.ZERO);
-        dadosDesmatamento.setFatorN2O(fatorN2O != null ? fatorN2O : BigDecimal.ZERO);
-        dadosDesmatamento.setValorUnico(ufs == null || ufs.isEmpty());
-        dadosDesmatamento.setFatorMut(fatorMut);
-        
-        fatorMut.setDadosDesmatamento(List.of(dadosDesmatamento));
+
+        DadosDesmatamento dd = new DadosDesmatamento();
+        dd.setBioma(bioma);
+        dd.setNomeFitofisionomia(nomeFitofisionomia.trim());
+        dd.setSiglaFitofisionomia(siglaFitofisionomia);
+        dd.setCategoriaDesmatamento(categoriaDesmatamento);
+        dd.setUfs(ufs);
+        dd.setEstoqueCarbono(estoqueCarbono != null ? estoqueCarbono : BigDecimal.ZERO);
+        dd.setFatorCO2(fatorCO2 != null ? fatorCO2 : BigDecimal.ZERO);
+        dd.setFatorCH4(fatorCH4 != null ? fatorCH4 : BigDecimal.ZERO);
+        dd.setFatorN2O(fatorN2O != null ? fatorN2O : BigDecimal.ZERO);
+        dd.setValorUnico(ufs == null || ufs.isEmpty());
+        dd.setFatorMut(fatorMut);
+
+        fatorMut.setDadosDesmatamento(List.of(dd));
         fatorMutRepository.save(fatorMut);
-        
-        log.debug("Linha {} da aba {} processada com sucesso: {}", numeroLinha, nomeAba, nome);
+
+        log.debug("Linha {} da aba {} processada (Desmatamento): {}", numeroLinha, nomeAba, nome);
     }
 
     private void processarLinhaVegetacao(Row row, int numeroLinha, String nomeAba) {
-        // Extrai valores específicos para Vegetação
         String nome = getCellValueAsString(row.getCell(0));
         String escopoStr = getCellValueAsString(row.getCell(1));
         String biomaStr = getCellValueAsString(row.getCell(2));
@@ -564,95 +481,72 @@ public class MutService {
         BigDecimal fatorCH4 = getCellValueAsBigDecimal(row.getCell(6));
         BigDecimal fatorN2O = getCellValueAsBigDecimal(row.getCell(7));
 
-        // Validações obrigatórias
         validarCamposObrigatorios(nome, escopoStr, biomaStr, numeroLinha, nomeAba);
-        
         if (categoriasFitofisionomiaStr == null || categoriasFitofisionomiaStr.trim().isEmpty()) {
             throw new ValidacaoException("Categorias Fitofisionomia é obrigatório na linha " + numeroLinha + " da aba " + nomeAba);
         }
 
-        // Conversões
         EscopoEnum escopo = converterEscopo(escopoStr);
         Bioma bioma = converterBioma(biomaStr);
-        
-        // Log da conversão de valores simples para array
-        log.debug("Linha {}: Convertendo categorias fitofisionomia '{}' para array", numeroLinha, categoriasFitofisionomiaStr);
-        Set<CategoriaDesmatamento> categoriasFitofisionomia = converterCategoriasFitofisionomia(categoriasFitofisionomiaStr);
-        log.debug("Linha {}: Categorias convertidas: {}", numeroLinha, categoriasFitofisionomia);
 
-        // Verifica duplicatas
-        if (fatorMutRepository.existsByTipoMudancaAndEscopoAndAtivoTrue(TipoMudanca.VEGETACAO, escopo)) {
-            throw new ValidacaoException(
-                String.format("Fator MUT Vegetação ativo já existe na linha %d da aba %s com Escopo: '%s'", 
-                             numeroLinha, nomeAba, escopo));
-        }
+        Set<CategoriaDesmatamento> categorias = converterCategoriasFitofisionomia(categoriasFitofisionomiaStr);
 
-        // Cria ou reativa fator MUT
         FatorMut fatorMut = criarOuReativarFatorMut(TipoMudanca.VEGETACAO, escopo, numeroLinha, nomeAba);
-        
-        // Cria dados específicos da Vegetação
-        DadosVegetacao dadosVegetacao = new DadosVegetacao();
-        dadosVegetacao.setBioma(bioma);
-        dadosVegetacao.setCategoriasFitofisionomia(categoriasFitofisionomia);
-        dadosVegetacao.setParametro(parametro != null ? parametro.trim() : "Importado via Excel");
-        dadosVegetacao.setFatorCO2(fatorCO2 != null ? fatorCO2 : BigDecimal.ZERO);
-        dadosVegetacao.setFatorCH4(fatorCH4 != null ? fatorCH4 : BigDecimal.ZERO);
-        dadosVegetacao.setFatorN2O(fatorN2O != null ? fatorN2O : BigDecimal.ZERO);
-        dadosVegetacao.setFatorMut(fatorMut);
-        
-        fatorMut.setDadosVegetacao(List.of(dadosVegetacao));
+
+        DadosVegetacao dv = new DadosVegetacao();
+        dv.setFatorMut(fatorMut);
+        dv.setBioma(bioma); // manter padrão/compat
+        dv.setCategoriasFitofisionomia(categorias);
+        dv.setParametro(parametro != null ? parametro.trim() : "Importado via Excel");
+        dv.setFatorCO2(fatorCO2 != null ? fatorCO2 : BigDecimal.ZERO);
+        dv.setFatorCH4(fatorCH4 != null ? fatorCH4 : BigDecimal.ZERO);
+        dv.setFatorN2O(fatorN2O != null ? fatorN2O : BigDecimal.ZERO);
+
+        fatorMut.setDadosVegetacao(List.of(dv));
         fatorMutRepository.save(fatorMut);
-        
-        log.debug("Linha {} da aba {} processada com sucesso: {}", numeroLinha, nomeAba, nome);
+
+        log.debug("Linha {} da aba {} processada (Vegetação): {}", numeroLinha, nomeAba, nome);
     }
 
     private void validarCamposObrigatorios(String nome, String escopoStr, String biomaStr, int numeroLinha, String nomeAba) {
-        if (nome == null || nome.trim().isEmpty()) {
+        if (nome == null || nome.trim().isEmpty())
             throw new ValidacaoException("Nome é obrigatório na linha " + numeroLinha + " da aba " + nomeAba);
-        }
-        
-        if (escopoStr == null || escopoStr.trim().isEmpty()) {
+        if (escopoStr == null || escopoStr.trim().isEmpty())
             throw new ValidacaoException("Escopo é obrigatório na linha " + numeroLinha + " da aba " + nomeAba);
-        }
-        
-        if (biomaStr == null || biomaStr.trim().isEmpty()) {
+        if (biomaStr == null || biomaStr.trim().isEmpty())
             throw new ValidacaoException("Bioma é obrigatório na linha " + numeroLinha + " da aba " + nomeAba);
-        }
     }
 
-    private FatorMut criarOuReativarFatorMut(TipoMudanca tipoMudanca, EscopoEnum escopo, int numeroLinha, String nomeAba) {
-        List<FatorMut> fatoresInativos = fatorMutRepository.findByTipoMudancaAndEscopoAndAtivoFalse(tipoMudanca, escopo);
-        
-        FatorMut fatorMut;
-        if (!fatoresInativos.isEmpty()) {
-            fatorMut = fatoresInativos.get(0);
-            fatorMut.setAtivo(true);
-            fatorMut.setDataAtualizacao(LocalDateTime.now());
-            log.debug("Reativando fator MUT existente na linha {} da aba {}", numeroLinha, nomeAba);
+    private FatorMut criarOuReativarFatorMut(TipoMudanca tipoMudanca, EscopoEnum escopo, int linha, String aba) {
+        List<FatorMut> inativos = fatorMutRepository.findByTipoMudancaAndEscopoAndAtivoFalse(tipoMudanca, escopo);
+        FatorMut f;
+        if (!inativos.isEmpty()) {
+            f = inativos.get(0);
+            f.setAtivo(true);
+            f.setDataAtualizacao(LocalDateTime.now());
+            log.debug("Reativando Fator MUT (linha {} / aba {})", linha, aba);
         } else {
-            fatorMut = new FatorMut();
-            fatorMut.setTipoMudanca(tipoMudanca);
-            fatorMut.setEscopo(escopo);
-            fatorMut.setAtivo(true);
-            fatorMut.setDataAtualizacao(LocalDateTime.now()); // Adicionar esta linha
-            log.debug("Criando novo fator MUT na linha {} da aba {}", numeroLinha, nomeAba);
+            f = new FatorMut();
+            f.setTipoMudanca(tipoMudanca);
+            f.setEscopo(escopo);
+            f.setAtivo(true);
+            f.setDataAtualizacao(LocalDateTime.now());
+            log.debug("Criando Fator MUT (linha {} / aba {})", linha, aba);
         }
-        
-        return fatorMut;
+        return f;
     }
 
     private TipoMudanca converterTipoMudanca(String valor) {
         if (valor == null || valor.trim().isEmpty()) {
             throw new ValidacaoException("Tipo de mudança não pode ser vazio");
         }
-        
-        String valorLimpo = valor.trim().toUpperCase();
-        return switch (valorLimpo) {
+        String v = valor.trim().toUpperCase();
+        return switch (v) {
             case "DESMATAMENTO" -> TipoMudanca.DESMATAMENTO;
             case "VEGETACAO", "VEGETAÇÃO" -> TipoMudanca.VEGETACAO;
             case "SOLO" -> TipoMudanca.SOLO;
-            default -> throw new ValidacaoException("Tipo de mudança inválido: " + valor + 
-                ". Valores aceitos: DESMATAMENTO, VEGETACAO, SOLO");
+            default -> throw new ValidacaoException("Tipo de mudança inválido: " + valor +
+                    ". Valores: DESMATAMENTO, VEGETACAO, SOLO");
         };
     }
 
@@ -660,14 +554,13 @@ public class MutService {
         if (valor == null || valor.trim().isEmpty()) {
             throw new ValidacaoException("Escopo não pode ser vazio");
         }
-        
-        String valorLimpo = valor.trim().toUpperCase().replace(" ", "_");
-        return switch (valorLimpo) {
+        String v = valor.trim().toUpperCase().replace(" ", "_");
+        return switch (v) {
             case "ESCOPO_1", "ESCOPO1", "1" -> EscopoEnum.ESCOPO1;
             case "ESCOPO_2", "ESCOPO2", "2" -> EscopoEnum.ESCOPO2;
             case "ESCOPO_3", "ESCOPO3", "3" -> EscopoEnum.ESCOPO3;
-            default -> throw new ValidacaoException("Escopo inválido: " + valor + 
-                ". Valores aceitos: ESCOPO_1, ESCOPO_2, ESCOPO_3");
+            default -> throw new ValidacaoException("Escopo inválido: " + valor +
+                    ". Valores: ESCOPO_1, ESCOPO_2, ESCOPO_3");
         };
     }
 
@@ -675,10 +568,7 @@ public class MutService {
         if (tipoFatorSolo == null || tipoFatorSolo.trim().isEmpty()) {
             return TipoFatorSolo.USO_ANTERIOR_ATUAL;
         }
-
         String tipo = tipoFatorSolo.trim().toUpperCase();
-        
-        // Mapeamento para os novos valores do enum
         switch (tipo) {
             case "SOLO_LAC":
             case "SOLO DE BAIXA ATIVIDADE ARGILOSA (LAC)":
@@ -686,38 +576,31 @@ public class MutService {
             case "ALTO_CARBONO":
             case "BAIXO_CARBONO":
                 return TipoFatorSolo.USO_ANTERIOR_ATUAL;
-                
             case "SOLO_ARENOSO":
             case "SOLO ARENOSO":
             case "ARENOSO":
             case "MINERAL":
             case "ORGANICO":
                 return TipoFatorSolo.SOLO_USO_ANTERIOR_ATUAL;
-                
             case "USO_ANTERIOR_ATUAL":
                 return TipoFatorSolo.USO_ANTERIOR_ATUAL;
-                
             case "SOLO_USO_ANTERIOR_ATUAL":
                 return TipoFatorSolo.SOLO_USO_ANTERIOR_ATUAL;
-                
             default:
-                throw new IllegalArgumentException("Tipo de fator solo inválido: " + tipoFatorSolo + 
-                    ". Valores aceitos: USO_ANTERIOR_ATUAL, SOLO_USO_ANTERIOR_ATUAL");
+                throw new IllegalArgumentException("Tipo de fator solo inválido: " + tipoFatorSolo +
+                        ". Aceitos: USO_ANTERIOR_ATUAL, SOLO_USO_ANTERIOR_ATUAL");
         }
     }
 
     private SiglaFitofisionomia converterSiglaFitofisionomia(String valor) {
         if (valor == null || valor.trim().isEmpty()) {
-            return SiglaFitofisionomia.FOD; // Default value
+            return SiglaFitofisionomia.FOD;
         }
-        
-        String valorLimpo = valor.trim();
+        String v = valor.trim();
         try {
-            return SiglaFitofisionomia.fromCodigo(valorLimpo);
+            return SiglaFitofisionomia.fromCodigo(v);
         } catch (IllegalArgumentException e) {
-            // Log the error but don't throw exception, return default value instead
-            log.warn("Sigla Fitofisionomia inválida '{}', usando valor padrão FOD. Valores aceitos: {}", 
-                valor, Arrays.toString(SiglaFitofisionomia.values()));
+            log.warn("Sigla Fitofisionomia inválida '{}', usando FOD. Valores: {}", valor, Arrays.toString(SiglaFitofisionomia.values()));
             return SiglaFitofisionomia.FOD;
         }
     }
@@ -726,18 +609,15 @@ public class MutService {
         if (valor == null || valor.trim().isEmpty()) {
             throw new ValidacaoException("Categoria Desmatamento não pode ser vazia");
         }
-        
-        // Remove possíveis caracteres de formatação JSON/array que podem vir do Excel
-        String valorLimpo = valor.trim()
-            .replaceAll("^\\[|\\]$", "")  // Remove colchetes do início/fim
-            .replaceAll("\"|\'|", "")      // Remove aspas
-            .trim();
-        
+        String limpo = valor.trim()
+                .replaceAll("^\\[|\\]$", "")
+                .replaceAll("[\"']", "") // << CORREÇÃO DE REGEX
+                .trim();
         try {
-            return CategoriaDesmatamento.fromString(valorLimpo);
+            return CategoriaDesmatamento.fromString(limpo);
         } catch (IllegalArgumentException e) {
-            throw new ValidacaoException("Categoria Desmatamento inválida: " + valor + 
-                ". Valores aceitos: O, F, OFL, G. Use valores simples sem colchetes ou aspas.");
+            throw new ValidacaoException("Categoria Desmatamento inválida: " + valor +
+                    ". Aceitos: O, F, OFL, G. Informe sem colchetes/aspas.");
         }
     }
 
@@ -745,27 +625,19 @@ public class MutService {
         if (valor == null || valor.trim().isEmpty()) {
             throw new ValidacaoException("Categorias Fitofisionomia não pode ser vazia");
         }
-        
         Set<CategoriaDesmatamento> categorias = new HashSet<>();
-        
-        // Remove possíveis caracteres de formatação JSON/array que podem vir do Excel
-        String valorLimpo = valor.trim()
-            .replaceAll("^\\[|\\]$", "")  // Remove colchetes do início/fim
-            .replaceAll("\"|\'|", "")      // Remove aspas
-            .trim();
-        
-        // Divide por vírgula, ponto e vírgula ou espaço
-        String[] valores = valorLimpo.split("[,;\\s]+");
-        
+        String limpo = valor.trim()
+                .replaceAll("^\\[|\\]$", "")
+                .replaceAll("[\"']", "") // << CORREÇÃO DE REGEX
+                .trim();
+        String[] valores = limpo.split("[,;\\s]+");
         for (String v : valores) {
             if (v.trim().isEmpty()) continue;
             categorias.add(converterCategoriaDesmatamento(v.trim()));
         }
-        
         if (categorias.isEmpty()) {
             throw new ValidacaoException("Pelo menos uma Categoria Fitofisionomia deve ser informada: " + valor);
         }
-        
         return categorias;
     }
 
@@ -773,78 +645,55 @@ public class MutService {
         if (valor == null || valor.trim().isEmpty()) {
             throw new ValidacaoException("Bioma não pode ser vazio");
         }
-        
-        String valorLimpo = valor.trim().toUpperCase();
-        return switch (valorLimpo) {
+        String v = valor.trim().toUpperCase();
+        return switch (v) {
             case "AMAZONIA", "AMAZÔNIA" -> Bioma.AMAZONIA;
             case "CAATINGA" -> Bioma.CAATINGA;
             case "CERRADO" -> Bioma.CERRADO;
             case "MATA_ATLANTICA", "MATA ATLÂNTICA", "MATA ATLANTICA" -> Bioma.MATA_ATLANTICA;
             case "PAMPA" -> Bioma.PAMPA;
             case "PANTANAL" -> Bioma.PANTANAL;
-            default -> throw new ValidacaoException("Bioma inválido: " + valor + 
-                ". Valores aceitos: AMAZONIA, CAATINGA, CERRADO, MATA_ATLANTICA, PAMPA, PANTANAL");
+            default -> throw new ValidacaoException("Bioma inválido: " + valor +
+                    ". Aceitos: AMAZONIA, CAATINGA, CERRADO, MATA_ATLANTICA, PAMPA, PANTANAL");
         };
     }
 
     private Set<UF> converterUfs(String valor) {
-        if (valor == null || valor.trim().isEmpty()) {
-            return new HashSet<>(); // UFs são opcionais
-        }
-        
+        if (valor == null || valor.trim().isEmpty()) return new HashSet<>();
         Set<UF> ufs = new HashSet<>();
-        
-        // Remove possíveis caracteres de formatação JSON/array que podem vir do Excel
-        String valorLimpo = valor.trim()
-            .replaceAll("^\\[|\\]$", "")  // Remove colchetes do início/fim
-            .replaceAll("\"|'|", "")      // Remove aspas
-            .trim();
-        
-        // Divide por vírgula, ponto e vírgula ou espaço
-        String[] valores = valorLimpo.split("[,;\\s]+");
-        
+        String limpo = valor.trim()
+                .replaceAll("^\\[|\\]$", "")
+                .replaceAll("[\"']", "") // << CORREÇÃO DE REGEX
+                .trim();
+        String[] valores = limpo.split("[,;\\s]+");
         for (String v : valores) {
             if (v.trim().isEmpty()) continue;
-            
             String ufLimpa = v.trim().toUpperCase();
             try {
                 UF uf = UF.valueOf(ufLimpa);
                 ufs.add(uf);
             } catch (IllegalArgumentException e) {
-                throw new ValidacaoException("UF inválida: " + v + 
-                    ". Valores aceitos: " + Arrays.toString(UF.values()) + 
-                    ". Use valores simples sem colchetes ou aspas.");
+                throw new ValidacaoException("UF inválida: " + v +
+                        ". Valores aceitos: " + Arrays.toString(UF.values()) + ". Sem colchetes/aspas.");
             }
         }
-        
         return ufs;
     }
 
     private String getCellValueAsString(Cell cell) {
         if (cell == null) return null;
-        
         return switch (cell.getCellType()) {
             case STRING -> cell.getStringCellValue();
             case NUMERIC -> {
-                if (DateUtil.isCellDateFormatted(cell)) {
-                    yield cell.getDateCellValue().toString();
-                } else {
-                    // Remove decimais desnecessários para números inteiros
-                    double numValue = cell.getNumericCellValue();
-                    if (numValue == Math.floor(numValue)) {
-                        yield String.valueOf((long) numValue);
-                    } else {
-                        yield String.valueOf(numValue);
-                    }
-                }
+                if (DateUtil.isCellDateFormatted(cell)) yield cell.getDateCellValue().toString();
+                double numValue = cell.getNumericCellValue();
+                if (numValue == Math.floor(numValue)) yield String.valueOf((long) numValue);
+                yield String.valueOf(numValue);
             }
             case BOOLEAN -> String.valueOf(cell.getBooleanCellValue());
             case FORMULA -> {
-                try {
-                    yield String.valueOf(cell.getNumericCellValue());
-                } catch (Exception e) {
-                    yield cell.getStringCellValue();
-                }
+                try { yield String.valueOf(cell.getNumericCellValue()); }
+                catch (Exception e) { yield cell.getStringCellValue(); }
             }
             default -> null;
         };
@@ -852,18 +701,13 @@ public class MutService {
 
     private BigDecimal getCellValueAsBigDecimal(Cell cell) {
         if (cell == null) return BigDecimal.ZERO;
-        
         return switch (cell.getCellType()) {
             case NUMERIC -> BigDecimal.valueOf(cell.getNumericCellValue());
             case STRING -> {
                 String value = cell.getStringCellValue().trim();
-                if (value.isEmpty()) {
-                    yield BigDecimal.ZERO;
-                }
+                if (value.isEmpty()) yield BigDecimal.ZERO;
                 try {
-                    // Remove caracteres não numéricos exceto ponto e vírgula
                     value = value.replaceAll("[^0-9.,\\-]", "");
-                    // Substitui vírgula por ponto para decimal
                     value = value.replace(",", ".");
                     yield new BigDecimal(value);
                 } catch (NumberFormatException e) {
@@ -871,11 +715,8 @@ public class MutService {
                 }
             }
             case FORMULA -> {
-                try {
-                    yield BigDecimal.valueOf(cell.getNumericCellValue());
-                } catch (Exception e) {
-                    yield BigDecimal.ZERO;
-                }
+                try { yield BigDecimal.valueOf(cell.getNumericCellValue()); }
+                catch (Exception e) { yield BigDecimal.ZERO; }
             }
             default -> BigDecimal.ZERO;
         };
@@ -883,22 +724,17 @@ public class MutService {
 
     private boolean isRowEmpty(Row row) {
         if (row == null) return true;
-        
-        // Verifica as 7 colunas obrigatórias
-        for (int i = 0; i < 7; i++) {
+        for (int i = 0; i < 7; i++) { // checagem leve
             Cell cell = row.getCell(i);
             if (cell != null && cell.getCellType() != CellType.BLANK) {
                 String value = getCellValueAsString(cell);
-                if (value != null && !value.trim().isEmpty()) {
-                    return false;
-                }
+                if (value != null && !value.trim().isEmpty()) return false;
             }
         }
         return true;
     }
 
     private void validarDadosMut(MutRequest request) {
-        // Nome é opcional - removida validação obrigatória
         if (request.getTipoMudanca() == null)
             throw new ValidacaoException("Tipo de mudança é obrigatório");
         if (request.getEscopo() == null)
@@ -949,44 +785,27 @@ public class MutService {
     }
 
     private void processarDadosEspecificos(FatorMut fatorMut, MutRequest request) {
-        log.debug("Processando dados específicos para tipo: {}", request.getTipoMudanca());
-        
+        log.debug("Processando dados específicos: {}", request.getTipoMudanca());
         try {
             switch (request.getTipoMudanca()) {
-                case DESMATAMENTO -> {
-                    int qtdDados = request.getDadosDesmatamento() != null ? request.getDadosDesmatamento().size() : 0;
-                    log.debug("Processando {} registros de desmatamento", qtdDados);
-                    processarDadosDesmatamento(fatorMut, request.getDadosDesmatamento());
-                }
-                case VEGETACAO -> {
-                    int qtdDados = request.getDadosVegetacao() != null ? request.getDadosVegetacao().size() : 0;
-                    log.debug("Processando {} registros de vegetação", qtdDados);
-                    processarDadosVegetacao(fatorMut, request.getDadosVegetacao());
-                }
-                case SOLO -> {
-                    int qtdDados = request.getDadosSolo() != null ? request.getDadosSolo().size() : 0;
-                    log.debug("Processando {} registros de solo", qtdDados);
-                    processarDadosSolo(fatorMut, request.getDadosSolo());
-                }
+                case DESMATAMENTO -> processarDadosDesmatamento(fatorMut, request.getDadosDesmatamento());
+                case VEGETACAO -> processarDadosVegetacao(fatorMut, request.getDadosVegetacao());
+                case SOLO -> processarDadosSolo(fatorMut, request.getDadosSolo());
             }
-            log.debug("Processamento de dados específicos concluído com sucesso");
         } catch (Exception e) {
-            log.error("Erro ao processar dados específicos para tipo {}: {}", request.getTipoMudanca(), e.getMessage(), e);
+            log.error("Erro ao processar dados específicos ({}): {}", request.getTipoMudanca(), e.getMessage(), e);
             throw new ValidacaoException("Erro ao processar dados específicos: " + e.getMessage());
         }
     }
 
     private void processarDadosDesmatamento(FatorMut fatorMut, List<MutRequest.DadosDesmatamentoRequest> dados) {
-        // ✅ CORREÇÃO: Adicionar validação para campos obrigatórios
         for (MutRequest.DadosDesmatamentoRequest d : dados) {
-            if (d.getNomeFitofisionomia() == null || d.getNomeFitofisionomia().trim().isEmpty()) {
+            if (d.getNomeFitofisionomia() == null || d.getNomeFitofisionomia().trim().isEmpty())
                 throw new ValidacaoException("Nome da fitofisionomia é obrigatório");
-            }
-            if (d.getSiglaFitofisionomia() == null) {
+            if (d.getSiglaFitofisionomia() == null)
                 throw new ValidacaoException("Sigla da fitofisionomia é obrigatória");
-            }
         }
-        
+
         List<DadosDesmatamento> lista = dados.stream().map(d -> {
             DadosDesmatamento dd = new DadosDesmatamento();
             dd.setFatorMut(fatorMut);
@@ -1000,7 +819,6 @@ public class MutService {
             dd.setFatorCO2(d.getFatorCO2());
             dd.setFatorCH4(d.getFatorCH4());
             dd.setFatorN2O(d.getFatorN2O());
-            
             return dd;
         }).collect(Collectors.toList());
         fatorMut.setDadosDesmatamento(lista);
@@ -1010,13 +828,7 @@ public class MutService {
         List<DadosVegetacao> lista = dados.stream().map(d -> {
             DadosVegetacao dv = new DadosVegetacao();
             dv.setFatorMut(fatorMut);
-            // ✅ FIX: Se bioma for null, não definir (deixar null para campo opcional)
-            // Como o campo tem NOT NULL constraint, vamos usar um valor padrão
-            if (d.getBioma() != null) {
-                dv.setBioma(d.getBioma());
-            }
-            // Note: O campo bioma tem constraint NOT NULL no banco, então precisamos de um valor
-            // Mas como está sendo usado como opcional no código, vamos remover a constraint
+            if (d.getBioma() != null) dv.setBioma(d.getBioma());
             dv.setCategoriasFitofisionomia(d.getCategoriasFitofisionomia());
             dv.setParametro(d.getParametro());
             dv.setValorAmazonia(d.getValorAmazonia());
@@ -1035,26 +847,31 @@ public class MutService {
 
     private void processarDadosSolo(FatorMut fatorMut, List<MutRequest.DadosSoloRequest> dados) {
         if (dados == null || dados.isEmpty()) {
-            // Criar dados padrão quando não há dados fornecidos
             criarDadosSoloPadrao(fatorMut);
             return;
         }
-        
         List<DadosSolo> lista = dados.stream().map(d -> {
             DadosSolo ds = new DadosSolo();
             ds.setFatorMut(fatorMut);
             ds.setTipoFatorSolo(d.getTipoFatorSolo());
             ds.setValorFator(d.getValorFator());
+            // descricao agora é somente a REFERÊNCIA (independente por escopo)
             ds.setDescricao(d.getDescricao());
             ds.setBioma(d.getBioma());
-            ds.setFatorCO2(d.getFatorCO2());
-            ds.setFatorCH4(d.getFatorCH4());
+            ds.setFatorCO2(d.getFatorCO2());   // LAC (quando usado pra guardar LAC)
+            ds.setFatorCH4(d.getFatorCH4());   // Arenoso (quando usado pra guardar Arenoso)
             ds.setFatorN2O(d.getFatorN2O());
             ds.setUsoAnterior(d.getUsoAnterior());
             ds.setUsoAtual(d.getUsoAtual());
+            // Define principal com base em CO2/CH4 nulos
+            boolean isPrincipal = (ds.getFatorCO2() == null && ds.getFatorCH4() == null);
+            ds.setPrincipal(isPrincipal);
+            ds.setReplicadoAutomatico(Boolean.FALSE);
+
+            // fallback: se vier descricao no formato "de A para B" ainda extrai
             if ((ds.getUsoAnterior() == null || ds.getUsoAnterior().isBlank()
-                 || ds.getUsoAtual() == null || ds.getUsoAtual().isBlank())
-                && ds.getDescricao() != null && !ds.getDescricao().isBlank()) {
+                    || ds.getUsoAtual() == null || ds.getUsoAtual().isBlank())
+                    && ds.getDescricao() != null && !ds.getDescricao().isBlank()) {
                 String[] dePara = extractDePara(ds.getDescricao());
                 if (dePara != null) {
                     ds.setUsoAnterior(dePara[0]);
@@ -1069,8 +886,8 @@ public class MutService {
     private String[] extractDePara(String desc) {
         String t = desc.replaceAll("\\s*[→➡➔]\\s*", "->").trim();
         java.util.regex.Matcher m = java.util.regex.Pattern
-          .compile("de\\s+(.+?)\\s+para\\s+(.+)", java.util.regex.Pattern.CASE_INSENSITIVE)
-          .matcher(t);
+                .compile("de\\s+(.+?)\\s+para\\s+(.+)", java.util.regex.Pattern.CASE_INSENSITIVE)
+                .matcher(t);
         if (m.find()) return new String[]{normalizeUso(m.group(1)), normalizeUso(m.group(2))};
         String[] parts = t.split("\\s*->\\s*");
         if (parts.length == 2) return new String[]{normalizeUso(parts[0]), normalizeUso(parts[1])};
@@ -1086,172 +903,168 @@ public class MutService {
     }
 
     private void limparDadosEspecificos(FatorMut fatorMut) {
-        // First, manually delete ElementCollection records that have composite primary keys
         if (fatorMut.getDadosVegetacao() != null && !fatorMut.getDadosVegetacao().isEmpty()) {
             for (DadosVegetacao dv : fatorMut.getDadosVegetacao()) {
                 if (dv.getId() != null) {
-                    // Delete vegetacao_categorias records manually to avoid composite key constraint issues
                     entityManager.createNativeQuery(
-                        "DELETE FROM vegetacao_categorias WHERE dados_vegetacao_id = :dadosVegetacaoId")
-                        .setParameter("dadosVegetacaoId", dv.getId())
-                        .executeUpdate();
+                                    "DELETE FROM vegetacao_categorias WHERE dados_vegetacao_id = :id")
+                            .setParameter("id", dv.getId())
+                            .executeUpdate();
                 }
             }
         }
-        
-        // Clear the collections after manual cleanup
-        if (fatorMut.getDadosDesmatamento() != null) {
-            fatorMut.getDadosDesmatamento().clear();
+        if (fatorMut.getDadosDesmatamento() != null) fatorMut.getDadosDesmatamento().clear();
+        if (fatorMut.getDadosVegetacao() != null) fatorMut.getDadosVegetacao().clear();
+        if (fatorMut.getDadosSolo() != null) fatorMut.getDadosSolo().clear();
+
+        // Apaga explicitamente filhos de SOLO para evitar duplicidade ao reinserir
+        if (fatorMut.getId() != null) {
+            entityManager.createNativeQuery(
+                    "DELETE FROM dados_solo WHERE fator_mut_id = :id")
+                .setParameter("id", fatorMut.getId())
+                .executeUpdate();
         }
-        
-        if (fatorMut.getDadosVegetacao() != null) {
-            fatorMut.getDadosVegetacao().clear();
-        }
-        
-        if (fatorMut.getDadosSolo() != null) {
-            fatorMut.getDadosSolo().clear();
-        }
-        
-        // Force persistence of changes to ensure old data is removed
-    fatorMutRepository.saveAndFlush(fatorMut);
-    
-    // Force a flush to ensure all deletions are committed before new insertions
-    entityManager.flush();
+
+        fatorMutRepository.saveAndFlush(fatorMut);
+        entityManager.flush();
     }
 
-    // ✅ NOVO MÉTODO: Limpeza mais segura dos dados específicos
     private void limparDadosEspecificosSafe(FatorMut fatorMut) {
         try {
-            // First, manually delete ElementCollection records that have composite primary keys
             if (fatorMut.getDadosVegetacao() != null && !fatorMut.getDadosVegetacao().isEmpty()) {
                 for (DadosVegetacao dv : fatorMut.getDadosVegetacao()) {
                     if (dv.getId() != null) {
-                        // Delete vegetacao_categorias records manually to avoid composite key constraint issues
                         entityManager.createNativeQuery(
-                            "DELETE FROM vegetacao_categorias WHERE dados_vegetacao_id = :dadosVegetacaoId")
-                            .setParameter("dadosVegetacaoId", dv.getId())
-                            .executeUpdate();
+                                        "DELETE FROM vegetacao_categorias WHERE dados_vegetacao_id = :id")
+                                .setParameter("id", dv.getId())
+                                .executeUpdate();
                     }
                 }
             }
-            
-            // Clear the collections after manual cleanup
-            if (fatorMut.getDadosDesmatamento() != null) {
-                fatorMut.getDadosDesmatamento().clear();
+            if (fatorMut.getDadosDesmatamento() != null) fatorMut.getDadosDesmatamento().clear();
+            if (fatorMut.getDadosVegetacao() != null) fatorMut.getDadosVegetacao().clear();
+            if (fatorMut.getDadosSolo() != null) fatorMut.getDadosSolo().clear();
+
+            // Apaga explicitamente filhos de SOLO para evitar duplicidade ao reinserir
+            if (fatorMut.getId() != null) {
+                entityManager.createNativeQuery(
+                        "DELETE FROM dados_solo WHERE fator_mut_id = :id")
+                    .setParameter("id", fatorMut.getId())
+                    .executeUpdate();
             }
-            
-            if (fatorMut.getDadosVegetacao() != null) {
-                fatorMut.getDadosVegetacao().clear();
-            }
-            
-            if (fatorMut.getDadosSolo() != null) {
-                fatorMut.getDadosSolo().clear();
-            }
-            
-            // ✅ CORREÇÃO: Usar saveAndFlush com clear para garantir persistência
+
             fatorMutRepository.saveAndFlush(fatorMut);
-            entityManager.clear(); // Limpa o contexto de persistência
-            
+            entityManager.clear();
         } catch (Exception e) {
             log.error("Erro ao limpar dados específicos: {}", e.getMessage(), e);
             throw new ValidacaoException("Erro ao limpar dados específicos: " + e.getMessage());
         }
     }
 
-    // RN008A/B — valida unicidade das combinações por tipo
+    // ===== RN008 — Unicidade com as novas regras =====
     private void validarUnicidadeRN008(FatorMut fatorMut) {
         if (fatorMut == null || fatorMut.getTipoMudanca() == null || fatorMut.getEscopo() == null) return;
 
         switch (fatorMut.getTipoMudanca()) {
             case SOLO -> {
-                // Solo: Tipo de fator + Uso anterior + Uso atual
                 if (fatorMut.getDadosSolo() == null) return;
-                java.util.Set<String> chaves = new java.util.HashSet<>();
+
+                // Dentro do MESMO escopo: não pode duplicar combo de uso/tipo
+                Set<String> chaves = new HashSet<>();
                 for (DadosSolo ds : fatorMut.getDadosSolo()) {
                     if (ds.getTipoFatorSolo() == null) continue;
-                    String usoAnterior = safe(ds.getUsoAnterior());
-                    String usoAtual = safe(ds.getUsoAtual());
-                    if (usoAnterior.isEmpty() || usoAtual.isEmpty()) continue; // RN008B
-                    String key = "SOLO|" + ds.getTipoFatorSolo() + "|" + usoAnterior + "|" + usoAtual;
-                    if (!chaves.add(key)) {
-                        throw new DuplicacaoRegistroException(
-                            String.format("Já existe fator Solo para %s / %s → %s neste escopo.",
-                                          ds.getTipoFatorSolo(), usoAnterior, usoAtual));
+
+                    // Só considera o REGISTRO PRINCIPAL (fator de emissão) na chave replicada:
+                    // LAC (fatorCO2) e Arenoso (fatorCH4) NÃO entram aqui
+                    boolean isRegistroPrincipal = (ds.getFatorCO2() == null && ds.getFatorCH4() == null);
+                    if (isRegistroPrincipal) {
+                        String usoAnterior = safe(ds.getUsoAnterior());
+                        String usoAtual = safe(ds.getUsoAtual());
+                        if (!usoAnterior.isEmpty() && !usoAtual.isEmpty()) {
+                            String key = "SOLO|" + ds.getTipoFatorSolo() + "|" + usoAnterior + "|" + usoAtual;
+                            if (!chaves.add(key)) {
+                                throw new DuplicacaoRegistroException(
+                                        String.format("Já existe fator Solo para %s / %s → %s neste escopo.",
+                                                ds.getTipoFatorSolo(), usoAnterior, usoAtual));
+                            }
+                        }
                     }
-                    // ✅ Validação adicional por escopo para campos independentes (LAC/arenoso/referência/fator)
+
+                    // Campos INDEPENDENTES por escopo: antidupe por escopo (vale para principal e auxiliares)
                     long countIndep = contarDuplicidadeSoloIndependente(
-                        fatorMut.getEscopo(),
-                        ds.getValorFator(),
-                        ds.getFatorCO2(),
-                        ds.getFatorCH4(),
-                        safe(ds.getDescricao()),
-                        fatorMut.getId()
+                            fatorMut.getEscopo(),
+                            ds.getValorFator(),
+                            ds.getFatorCO2(),
+                            ds.getFatorCH4(),
+                            safe(ds.getDescricao()), // Referência
+                            fatorMut.getId()
                     );
                     if (countIndep > 0) {
                         throw new DuplicacaoRegistroException(
-                            "Valores de Solo (LAC/arenoso/referência/fator de emissão) já existem neste escopo.");
+                                "Valores de Solo (fator emissão/LAC/arenoso/referência) já existem neste escopo.");
                     }
                 }
             }
             case DESMATAMENTO -> {
                 if (fatorMut.getDadosDesmatamento() == null) return;
-                java.util.Set<String> chaves = new java.util.HashSet<>();
+
+                Set<String> chaves = new HashSet<>();
                 for (DadosDesmatamento dd : fatorMut.getDadosDesmatamento()) {
                     if (dd.getBioma() == null) continue;
-                    // Branch: valor único selecionado
+
+                    // Replicados: Bioma + (UFs quando habilitado) + Valor único
+                    String baseKey = "DESMATAMENTO|" + dd.getBioma();
                     if (Boolean.TRUE.equals(dd.getValorUnico())) {
-                        String key = "DESMATAMENTO|" + dd.getBioma() + "|VALOR_UNICO";
+                        String key = baseKey + "|VALOR_UNICO";
                         if (!chaves.add(key)) {
                             throw new DuplicacaoRegistroException(
-                                String.format("Já existe fator de Desmatamento para %s / Valor único neste escopo.", dd.getBioma()));
+                              String.format("Já existe fator de Desmatamento para %s / Valor único neste escopo.", dd.getBioma()));
                         }
                     } else {
-                        // Branch: UF habilitada (verifica cada UF da coleção)
-                        if (dd.getUfs() == null || dd.getUfs().isEmpty()) continue; // RN008B
+                        if (dd.getUfs() == null || dd.getUfs().isEmpty()) continue;
                         for (UF uf : dd.getUfs()) {
-                            String key = "DESMATAMENTO|" + dd.getBioma() + "|UF:" + uf;
+                            String key = baseKey + "|UF:" + uf;
                             if (!chaves.add(key)) {
                                 throw new DuplicacaoRegistroException(
-                                    String.format("Já existe fator de Desmatamento para %s / %s neste escopo.", dd.getBioma(), uf));
+                                  String.format("Já existe fator de Desmatamento para %s / %s neste escopo.", dd.getBioma(), uf));
                             }
                         }
                     }
-                    // ✅ Validação adicional por escopo para valores independentes (fitofisionomia/sigla/categoria/estoque)
+
+                    // Independentes por escopo
                     long countIndep = contarDuplicidadeDesmatamentoIndependente(
-                        fatorMut.getEscopo(),
-                        safe(dd.getNomeFitofisionomia()),
-                        dd.getSiglaFitofisionomia(),
-                        dd.getCategoriaDesmatamento(),
-                        dd.getEstoqueCarbono(),
-                        fatorMut.getId()
+                            fatorMut.getEscopo(),
+                            safe(dd.getNomeFitofisionomia()),
+                            dd.getSiglaFitofisionomia(),
+                            dd.getCategoriaDesmatamento(),
+                            dd.getEstoqueCarbono(),
+                            fatorMut.getId()
                     );
                     if (countIndep > 0) {
                         throw new DuplicacaoRegistroException(
-                            "Valores de Desmatamento (fitofisionomia/sigla/categoria/estoque) já existem neste escopo.");
+                           "Valores de Desmatamento (fitofisionomia/sigla/categoria/estoque) já existem neste escopo.");
                     }
                 }
             }
             case VEGETACAO -> {
                 if (fatorMut.getDadosVegetacao() == null) return;
-                java.util.Set<String> chaves = new java.util.HashSet<>();
+
+                // Replicados: Categoria da fitofisionomia + Parâmetro (por escopo)
+                Set<String> chaves = new HashSet<>();
                 for (DadosVegetacao dv : fatorMut.getDadosVegetacao()) {
                     String parametro = dv.getParametro();
-                    if (parametro == null || parametro.trim().isEmpty()) continue; // RN008B
-                    if (dv.getCategoriasFitofisionomia() == null || dv.getCategoriasFitofisionomia().isEmpty()) continue; // RN008B
-                    for (CategoriaDesmatamento cat : dv.getCategoriasFitofisionomia()) {
+                    if (parametro == null || parametro.trim().isEmpty()) continue;
+                    if (dv.getCategoriasFitofisionomia() == null || dv.getCategoriasFitofisionomia().isEmpty()) continue;
+
+                    for (var cat : dv.getCategoriasFitofisionomia()) {
                         String key = "VEGETACAO|" + cat + "|" + parametro.trim();
                         if (!chaves.add(key)) {
                             throw new DuplicacaoRegistroException(
                                 String.format("Já existe fator de Vegetação para %s / %s neste escopo.", cat, parametro));
                         }
-                        // ✅ Validação por escopo: categoria + parâmetro não pode duplicar
-                        long countIndep = contarDuplicidadeVegetacaoReplicativa(
-                            fatorMut.getEscopo(),
-                            cat,
-                            parametro.trim(),
-                            fatorMut.getId()
-                        );
-                        if (countIndep > 0) {
+                        long count = contarDuplicidadeVegetacaoReplicativa(
+                                fatorMut.getEscopo(), cat, parametro.trim(), fatorMut.getId());
+                        if (count > 0) {
                             throw new DuplicacaoRegistroException(
                                 "Categoria da fitofisionomia + Parâmetro já existem neste escopo.");
                         }
@@ -1261,23 +1074,22 @@ public class MutService {
         }
     }
 
-    // Helpers JPQL de contagem por escopo
     private long contarDuplicidadeSoloIndependente(EscopoEnum escopo, BigDecimal valorFator,
                                                    BigDecimal fatorCO2, BigDecimal fatorCH4,
                                                    String descricao, Long excluirFatorId) {
         String jpql = "SELECT COUNT(ds) FROM DadosSolo ds " +
-                      "WHERE ds.fatorMut.escopo = :escopo AND ds.fatorMut.ativo = true " +
-                      (excluirFatorId != null ? "AND ds.fatorMut.id <> :excluirId " : "") +
-                      "AND COALESCE(ds.valorFator, 0) = COALESCE(:valorFator, 0) " +
-                      "AND COALESCE(ds.fatorCO2, 0) = COALESCE(:fatorCO2, 0) " +
-                      "AND COALESCE(ds.fatorCH4, 0) = COALESCE(:fatorCH4, 0) " +
-                      "AND COALESCE(ds.descricao, '') = COALESCE(:descricao, '')";
+                "WHERE ds.fatorMut.escopo = :escopo AND ds.fatorMut.ativo = true " +
+                (excluirFatorId != null ? "AND ds.fatorMut.id <> :excluirId " : "") +
+                "AND COALESCE(ds.valorFator, 0) = COALESCE(:valorFator, 0) " +
+                "AND COALESCE(ds.fatorCO2, 0) = COALESCE(:fatorCO2, 0) " +
+                "AND COALESCE(ds.fatorCH4, 0) = COALESCE(:fatorCH4, 0) " +
+                "AND COALESCE(ds.descricao, '') = COALESCE(:descricao, '')";
         var q = entityManager.createQuery(jpql, Long.class)
-            .setParameter("escopo", escopo)
-            .setParameter("valorFator", valorFator)
-            .setParameter("fatorCO2", fatorCO2)
-            .setParameter("fatorCH4", fatorCH4)
-            .setParameter("descricao", descricao);
+                .setParameter("escopo", escopo)
+                .setParameter("valorFator", valorFator)
+                .setParameter("fatorCO2", fatorCO2)
+                .setParameter("fatorCH4", fatorCH4)
+                .setParameter("descricao", descricao);
         if (excluirFatorId != null) q.setParameter("excluirId", excluirFatorId);
         return q.getSingleResult();
     }
@@ -1287,18 +1099,18 @@ public class MutService {
                                                            CategoriaDesmatamento categoria,
                                                            BigDecimal estoque, Long excluirFatorId) {
         String jpql = "SELECT COUNT(dd) FROM DadosDesmatamento dd " +
-                      "WHERE dd.fatorMut.escopo = :escopo AND dd.fatorMut.ativo = true " +
-                      (excluirFatorId != null ? "AND dd.fatorMut.id <> :excluirId " : "") +
-                      "AND COALESCE(dd.nomeFitofisionomia, '') = COALESCE(:nome, '') " +
-                      "AND dd.siglaFitofisionomia = :sigla " +
-                      "AND dd.categoriaDesmatamento = :categoria " +
-                      "AND COALESCE(dd.estoqueCarbono, 0) = COALESCE(:estoque, 0)";
+                "WHERE dd.fatorMut.escopo = :escopo AND dd.fatorMut.ativo = true " +
+                (excluirFatorId != null ? "AND dd.fatorMut.id <> :excluirId " : "") +
+                "AND COALESCE(dd.nomeFitofisionomia, '') = COALESCE(:nome, '') " +
+                "AND dd.siglaFitofisionomia = :sigla " +
+                "AND dd.categoriaDesmatamento = :categoria " +
+                "AND COALESCE(dd.estoqueCarbono, 0) = COALESCE(:estoque, 0)";
         var q = entityManager.createQuery(jpql, Long.class)
-            .setParameter("escopo", escopo)
-            .setParameter("nome", nome)
-            .setParameter("sigla", sigla)
-            .setParameter("categoria", categoria)
-            .setParameter("estoque", estoque);
+                .setParameter("escopo", escopo)
+                .setParameter("nome", nome)
+                .setParameter("sigla", sigla)
+                .setParameter("categoria", categoria)
+                .setParameter("estoque", estoque);
         if (excluirFatorId != null) q.setParameter("excluirId", excluirFatorId);
         return q.getSingleResult();
     }
@@ -1306,39 +1118,165 @@ public class MutService {
     private long contarDuplicidadeVegetacaoReplicativa(EscopoEnum escopo, CategoriaDesmatamento categoria,
                                                        String parametro, Long excluirFatorId) {
         String jpql = "SELECT COUNT(dv) FROM DadosVegetacao dv JOIN dv.categoriasFitofisionomia cat " +
-                      "WHERE dv.fatorMut.escopo = :escopo AND dv.fatorMut.ativo = true " +
-                      (excluirFatorId != null ? "AND dv.fatorMut.id <> :excluirId " : "") +
-                      "AND cat = :categoria AND dv.parametro = :parametro";
+                "WHERE dv.fatorMut.escopo = :escopo AND dv.fatorMut.ativo = true " +
+                (excluirFatorId != null ? "AND dv.fatorMut.id <> :excluirId " : "") +
+                "AND cat = :categoria AND dv.parametro = :parametro";
         var q = entityManager.createQuery(jpql, Long.class)
-            .setParameter("escopo", escopo)
-            .setParameter("categoria", categoria)
-            .setParameter("parametro", parametro);
+                .setParameter("escopo", escopo)
+                .setParameter("categoria", categoria)
+                .setParameter("parametro", parametro);
+        if (excluirFatorId != null) q.setParameter("excluirId", excluirFatorId);
+        return q.getSingleResult();
+    }
+
+    private long contarDuplicidadeVegetacaoIndependente(EscopoEnum escopo,
+                                                        BigDecimal amazonia,
+                                                        BigDecimal caatinga,
+                                                        BigDecimal cerrado,
+                                                        BigDecimal mataAtlantica,
+                                                        BigDecimal pampa,
+                                                        BigDecimal pantanal,
+                                                        Long excluirFatorId) {
+        String jpql = "SELECT COUNT(dv) FROM DadosVegetacao dv " +
+                "WHERE dv.fatorMut.escopo = :escopo AND dv.fatorMut.ativo = true " +
+                (excluirFatorId != null ? "AND dv.fatorMut.id <> :excluirId " : "") +
+                "AND COALESCE(dv.valorAmazonia, 0) = COALESCE(:amazonia, 0) " +
+                "AND COALESCE(dv.valorCaatinga, 0) = COALESCE(:caatinga, 0) " +
+                "AND COALESCE(dv.valorCerrado, 0) = COALESCE(:cerrado, 0) " +
+                "AND COALESCE(dv.valorMataAtlantica, 0) = COALESCE(:mataAtlantica, 0) " +
+                "AND COALESCE(dv.valorPampa, 0) = COALESCE(:pampa, 0) " +
+                "AND COALESCE(dv.valorPantanal, 0) = COALESCE(:pantanal, 0)";
+
+        var q = entityManager.createQuery(jpql, Long.class)
+                .setParameter("escopo", escopo)
+                .setParameter("amazonia", amazonia)
+                .setParameter("caatinga", caatinga)
+                .setParameter("cerrado", cerrado)
+                .setParameter("mataAtlantica", mataAtlantica)
+                .setParameter("pampa", pampa)
+                .setParameter("pantanal", pantanal);
+
         if (excluirFatorId != null) q.setParameter("excluirId", excluirFatorId);
         return q.getSingleResult();
     }
 
     private String safe(String s) { return s == null ? "" : s.trim(); }
 
-    private MutResponse converterParaResponse(FatorMut fatorMut) {
-        MutResponse r = new MutResponse();
-        r.setId(fatorMut.getId());
-        r.setTipoMudanca(fatorMut.getTipoMudanca());
-        r.setEscopo(fatorMut.getEscopo());
-        r.setAtivo(fatorMut.getAtivo());
-        r.setDataCriacao(fatorMut.getDataCriacao());
-        r.setDataAtualizacao(fatorMut.getDataAtualizacao());
-        if (fatorMut.getUsuario() != null)
-            r.setNomeUsuario(fatorMut.getUsuario().getNome());
+    // ===== Helper: normaliza string removendo acentos, trim e lower-case =====
+    private String normalizeNoAccentsLower(String s) {
+        if (s == null) return "";
+        String nfd = Normalizer.normalize(s.trim(), Normalizer.Form.NFD);
+        // remove diacríticos
+        String withoutAccents = nfd.replaceAll("\\p{M}", "");
+        return withoutAccents.toLowerCase();
+    }
 
-        if (fatorMut.getDadosDesmatamento() != null)
-            r.setDadosDesmatamento(fatorMut.getDadosDesmatamento().stream()
-                    .map(this::converterDadosDesmatamento).collect(Collectors.toList()));
-        if (fatorMut.getDadosVegetacao() != null)
-            r.setDadosVegetacao(fatorMut.getDadosVegetacao().stream()
-                    .map(this::converterDadosVegetacao).collect(Collectors.toList()));
-        if (fatorMut.getDadosSolo() != null)
-            r.setDadosSolo(fatorMut.getDadosSolo().stream()
-                    .map(this::converterDadosSolo).collect(Collectors.toList()));
+    // ===== Helper: localizar ID existente de Solo main (escopo + tipoFator + usoAnterior/usoAtual) =====
+    private Long buscarIdExistenteSoloMain(MutRequest request) {
+        if (request == null || request.getTipoMudanca() != TipoMudanca.SOLO) return null;
+        if (request.getEscopo() == null || request.getDadosSolo() == null || request.getDadosSolo().isEmpty()) return null;
+
+        MutRequest.DadosSoloRequest mainReq = request.getDadosSolo().stream()
+                .filter(ds -> ds.getFatorCO2() == null && ds.getFatorCH4() == null)
+                .findFirst()
+                .orElse(null);
+        if (mainReq == null) return null;
+
+        String tipoNorm = normalizeTipoFator(mainReq.getTipoFatorSolo());
+        String usoAnt = normalizeNoAccentsLower(mainReq.getUsoAnterior());
+        String usoAt  = normalizeNoAccentsLower(mainReq.getUsoAtual());
+
+        List<FatorMut> candidatos = fatorMutRepository
+                .findAllByTipoMudancaAndEscopoAndAtivoTrueOrderByDataAtualizacaoDesc(TipoMudanca.SOLO, request.getEscopo());
+
+        for (FatorMut fm : candidatos) {
+            List<DadosSolo> dsList = fm.getDadosSolo() != null ? fm.getDadosSolo() : Collections.emptyList();
+            boolean existeMainEquivalente = dsList.stream().anyMatch(ds -> {
+                String tipoDs = normalizeTipoFator(ds.getTipoFatorSolo());
+                String usoAntDs = normalizeNoAccentsLower(ds.getUsoAnterior());
+                String usoAtDs  = normalizeNoAccentsLower(ds.getUsoAtual());
+                return tipoDs.equals(tipoNorm)
+                        && usoAntDs.equals(usoAnt)
+                        && usoAtDs.equals(usoAt)
+                        && ds.getFatorCO2() == null
+                        && ds.getFatorCH4() == null;
+            });
+            if (existeMainEquivalente) {
+                return fm.getId();
+            }
+        }
+        return null;
+    }
+
+    // ===== Helper: verifica duplicidade Solo (escopo + tipoFator + usoAnterior/usoAtual) e lança 409 com idExistente =====
+    private void verificarDuplicidadeSoloComIdExistente(MutRequest request) {
+        if (request == null || request.getTipoMudanca() != TipoMudanca.SOLO) return;
+        if (request.getEscopo() == null || request.getDadosSolo() == null || request.getDadosSolo().isEmpty()) return;
+
+        // Main = registro sem CO2/CH4
+        MutRequest.DadosSoloRequest mainReq = request.getDadosSolo().stream()
+                .filter(ds -> ds.getFatorCO2() == null && ds.getFatorCH4() == null)
+                .findFirst()
+                .orElse(null);
+        if (mainReq == null) return;
+
+        String tipoNorm = normalizeTipoFator(mainReq.getTipoFatorSolo());
+        String usoAnt = normalizeNoAccentsLower(mainReq.getUsoAnterior());
+        String usoAt  = normalizeNoAccentsLower(mainReq.getUsoAtual());
+
+        // Procura FatorMut ativo no escopo que contenha um main equivalente
+        List<FatorMut> candidatos = fatorMutRepository
+                .findAllByTipoMudancaAndEscopoAndAtivoTrueOrderByDataAtualizacaoDesc(TipoMudanca.SOLO, request.getEscopo());
+
+        for (FatorMut fm : candidatos) {
+            List<DadosSolo> dsList = fm.getDadosSolo() != null ? fm.getDadosSolo() : Collections.emptyList();
+            boolean existeMainEquivalente = dsList.stream().anyMatch(ds -> {
+                String tipoDs = normalizeTipoFator(ds.getTipoFatorSolo());
+                String usoAntDs = normalizeNoAccentsLower(ds.getUsoAnterior());
+                String usoAtDs  = normalizeNoAccentsLower(ds.getUsoAtual());
+                return tipoDs.equals(tipoNorm)
+                        && usoAntDs.equals(usoAnt)
+                        && usoAtDs.equals(usoAt)
+                        && ds.getFatorCO2() == null
+                        && ds.getFatorCH4() == null;
+            });
+            if (existeMainEquivalente) {
+                // Lança DuplicacaoRegistroException contendo idExistente; handler deve serializar {codigo, mensagem, idExistente, ...}
+                throw new DuplicacaoRegistroException(
+                        "DADOS_DUPLICADOS",
+                        "Dados duplicados detectados. Verifique se o registro já existe.",
+                        fm.getId()
+                );
+            }
+        }
+    }
+
+    // Normaliza USO_ANTERIOR_ATUAL e SOLO_USO_ANTERIOR_ATUAL como equivalentes
+    private String normalizeTipoFator(TipoFatorSolo tipo) {
+        String raw = tipo == null ? "" : tipo.name();
+        return raw.trim().toUpperCase().replaceFirst("^SOLO_", "");
+    }
+
+    private String safeLower(String s) {
+        return s == null ? "" : s.trim().toLowerCase();
+    }
+
+    private MutResponse converterParaResponse(FatorMut f) {
+        MutResponse r = new MutResponse();
+        r.setId(f.getId());
+        r.setTipoMudanca(f.getTipoMudanca());
+        r.setEscopo(f.getEscopo());
+        r.setAtivo(f.getAtivo());
+        r.setDataCriacao(f.getDataCriacao());
+        r.setDataAtualizacao(f.getDataAtualizacao());
+        if (f.getUsuario() != null) r.setNomeUsuario(f.getUsuario().getNome());
+
+        if (f.getDadosDesmatamento() != null)
+            r.setDadosDesmatamento(f.getDadosDesmatamento().stream().map(this::converterDadosDesmatamento).toList());
+        if (f.getDadosVegetacao() != null)
+            r.setDadosVegetacao(f.getDadosVegetacao().stream().map(this::converterDadosVegetacao).toList());
+        if (f.getDadosSolo() != null)
+            r.setDadosSolo(f.getDadosSolo().stream().map(this::converterDadosSolo).toList());
         return r;
     }
 
@@ -1347,11 +1285,8 @@ public class MutService {
         r.setId(d.getId());
         r.setBioma(d.getBioma());
         r.setValorUnico(d.getValorUnico());
-        // Força o carregamento da coleção lazy dentro do contexto transacional
         Set<UF> ufs = d.getUfs();
-        if (ufs != null) {
-            ufs.size(); // Força a inicialização da coleção lazy
-        }
+        if (ufs != null) ufs.size(); // força inicialização
         r.setUfs(ufs);
         r.setNomeFitofisionomia(d.getNomeFitofisionomia());
         r.setSiglaFitofisionomia(d.getSiglaFitofisionomia());
@@ -1360,7 +1295,7 @@ public class MutService {
         r.setFatorCO2(d.getFatorCO2());
         r.setFatorCH4(d.getFatorCH4());
         r.setFatorN2O(d.getFatorN2O());
-        
+        r.setReplicadoAutomatico(Boolean.TRUE.equals(d.getReplicadoAutomatico()));
         return r;
     }
 
@@ -1368,14 +1303,9 @@ public class MutService {
         MutResponse.DadosVegetacaoResponse r = new MutResponse.DadosVegetacaoResponse();
         r.setId(d.getId());
         r.setBioma(d.getBioma());
-        
-        // ✅ CORREÇÃO: Força o carregamento da coleção lazy dentro do contexto transacional
         Set<CategoriaDesmatamento> categorias = d.getCategoriasFitofisionomia();
-        if (categorias != null) {
-            categorias.size(); // Força a inicialização da coleção lazy
-        }
+        if (categorias != null) categorias.size();
         r.setCategoriasFitofisionomia(categorias);
-        
         r.setParametro(d.getParametro());
         r.setValorAmazonia(d.getValorAmazonia());
         r.setValorCaatinga(d.getValorCaatinga());
@@ -1386,6 +1316,7 @@ public class MutService {
         r.setFatorCO2(d.getFatorCO2());
         r.setFatorCH4(d.getFatorCH4());
         r.setFatorN2O(d.getFatorN2O());
+        r.setReplicadoAutomatico(Boolean.TRUE.equals(d.getReplicadoAutomatico()));
         return r;
     }
 
@@ -1398,23 +1329,237 @@ public class MutService {
         r.setFatorCO2(d.getFatorCO2());
         r.setFatorCH4(d.getFatorCH4());
         r.setFatorN2O(d.getFatorN2O());
-        r.setDescricao(d.getDescricao());
+        r.setDescricao(d.getDescricao()); // agora só a Referência
         r.setUsoAnterior(d.getUsoAnterior());
         r.setUsoAtual(d.getUsoAtual());
+        r.setPrincipal(Boolean.TRUE.equals(d.getPrincipal()));
+        r.setReplicadoAutomatico(Boolean.TRUE.equals(d.getReplicadoAutomatico()));
         return r;
     }
 
     private void criarDadosSoloPadrao(FatorMut fatorMut) {
         DadosSolo ds = new DadosSolo();
         ds.setFatorMut(fatorMut);
-        ds.setTipoFatorSolo(TipoFatorSolo.USO_ANTERIOR_ATUAL); // Atualizado para novo valor padrão
+        ds.setTipoFatorSolo(TipoFatorSolo.USO_ANTERIOR_ATUAL);
         ds.setValorFator(BigDecimal.ZERO);
         ds.setDescricao("Dados padrão");
         ds.setBioma(Bioma.AMAZONIA);
         ds.setFatorCO2(BigDecimal.ZERO);
         ds.setFatorCH4(BigDecimal.ZERO);
         ds.setFatorN2O(BigDecimal.ZERO);
-        
         fatorMut.getDadosSolo().add(ds);
     }
+
+    private boolean isUniqueConstraintViolation(Throwable ex) {
+        if (ex == null) return false;
+        String message = ex.getMessage();
+        if (message != null) {
+            String lowerMessage = message.toLowerCase();
+            return lowerMessage.contains("unique") || 
+                   lowerMessage.contains("duplicate") || 
+                   lowerMessage.contains("constraint") ||
+                   lowerMessage.contains("violates");
+        }
+        return isUniqueConstraintViolation(ex.getCause());
+    }
+
+    private void replicarCamposComunsParaOutroEscopo(FatorMut fonte) {
+        try {
+            if (fonte == null || fonte.getEscopo() == null || fonte.getTipoMudanca() == null) return;
+            // Replicar apenas entre ESCOPO1 e ESCOPO3
+            if (fonte.getEscopo() != EscopoEnum.ESCOPO1 && fonte.getEscopo() != EscopoEnum.ESCOPO3) return;
+
+            EscopoEnum destino = fonte.getEscopo() == EscopoEnum.ESCOPO1 ? EscopoEnum.ESCOPO3 : EscopoEnum.ESCOPO1;
+
+            switch (fonte.getTipoMudanca()) {
+                case SOLO -> {
+                    List<DadosSolo> dsOrigList = fonte.getDadosSolo() != null ? fonte.getDadosSolo() : List.of();
+                    // Considera só o "registro principal": CO2/CH4 nulos
+                    DadosSolo principal = dsOrigList.stream()
+                            .filter(ds -> ds.getFatorCO2() == null && ds.getFatorCH4() == null)
+                            .findFirst().orElse(null);
+                    if (principal == null) return;
+                    String tipoNorm = normalizeTipoFator(principal.getTipoFatorSolo());
+                    String usoAnt = normalizeNoAccentsLower(principal.getUsoAnterior());
+                    String usoAt  = normalizeNoAccentsLower(principal.getUsoAtual());
+                    if (tipoNorm.isBlank() || usoAnt.isBlank() || usoAt.isBlank()) return;
+
+                    // Procura FatorMut destino
+                    List<FatorMut> candidatos = fatorMutRepository
+                            .findAllByTipoMudancaAndEscopoAndAtivoTrueOrderByDataAtualizacaoDesc(TipoMudanca.SOLO, destino);
+
+                    FatorMut alvo = null;
+                    for (FatorMut fm : candidatos) {
+                        List<DadosSolo> dsList = fm.getDadosSolo() != null ? fm.getDadosSolo() : List.of();
+                        boolean existsMain = dsList.stream().anyMatch(ds -> {
+                            String tipoDs = normalizeTipoFator(ds.getTipoFatorSolo());
+                            String usoAntDs = normalizeNoAccentsLower(ds.getUsoAnterior());
+                            String usoAtDs  = normalizeNoAccentsLower(ds.getUsoAtual());
+                            return tipoDs.equals(tipoNorm)
+                                    && usoAntDs.equals(usoAnt)
+                                    && usoAtDs.equals(usoAt)
+                                    && ds.getFatorCO2() == null
+                                    && ds.getFatorCH4() == null;
+                        });
+                        if (existsMain) {
+                            // Já replicado — nada a fazer
+                            return;
+                        }
+                        if (alvo == null) alvo = fm;
+                    }
+                    // Se não havia ativo, cria novo FatorMut no destino
+                    if (alvo == null) {
+                        alvo = new FatorMut();
+                        alvo.setTipoMudanca(TipoMudanca.SOLO);
+                        alvo.setEscopo(destino);
+                        alvo.setAtivo(true);
+                        alvo.setDadosSolo(new ArrayList<>());
+                    } else if (alvo.getDadosSolo() == null) {
+                        alvo.setDadosSolo(new ArrayList<>());
+                    }
+
+                    // Replica apenas os campos comuns, sem exclusivos
+                    DadosSolo dsRep = new DadosSolo();
+                    dsRep.setFatorMut(alvo);
+                    dsRep.setTipoFatorSolo(principal.getTipoFatorSolo());
+                    dsRep.setUsoAnterior(principal.getUsoAnterior());
+                    dsRep.setUsoAtual(principal.getUsoAtual());
+                    // Exclusivos NÃO replicados, mas garantir not-null e evitar RN008 indevida
+                    dsRep.setValorFator(BigDecimal.ZERO);
+                    dsRep.setDescricao("0");
+                    dsRep.setBioma(null);
+                    dsRep.setFatorCO2(null);
+                    dsRep.setFatorCH4(null);
+                    dsRep.setFatorN2O(BigDecimal.ZERO);
+                    dsRep.setPrincipal(Boolean.TRUE);
+                    dsRep.setReplicadoAutomatico(Boolean.TRUE);
+
+                    alvo.getDadosSolo().add(dsRep);
+                    alvo.setDataAtualizacao(LocalDateTime.now());
+                    fatorMutRepository.saveAndFlush(alvo);
+                }
+
+                case DESMATAMENTO -> {
+                    List<DadosDesmatamento> ddOrigList = fonte.getDadosDesmatamento() != null ? fonte.getDadosDesmatamento() : List.of();
+                    if (ddOrigList.isEmpty()) return;
+
+                    DadosDesmatamento comum = ddOrigList.get(0); // chave replicativa por escopo
+                    if (comum.getBioma() == null) return;
+                    Boolean valorUnico = comum.getValorUnico();
+                    Set<UF> ufs = comum.getUfs();
+
+                    List<FatorMut> candidatos = fatorMutRepository
+                            .findAllByTipoMudancaAndEscopoAndAtivoTrueOrderByDataAtualizacaoDesc(TipoMudanca.DESMATAMENTO, destino);
+
+                    FatorMut alvo = null;
+                    for (FatorMut fm : candidatos) {
+                        List<DadosDesmatamento> ddList = fm.getDadosDesmatamento() != null ? fm.getDadosDesmatamento() : List.of();
+                        boolean existsKey = ddList.stream().anyMatch(dd -> {
+                            if (dd.getBioma() != comum.getBioma()) return false;
+                            if (Boolean.TRUE.equals(valorUnico)) {
+                                return Boolean.TRUE.equals(dd.getValorUnico());
+                            } else {
+                                Set<UF> u = dd.getUfs() != null ? dd.getUfs() : Set.of();
+                                Set<UF> v = ufs != null ? ufs : Set.of();
+                                return u.equals(v) && !Boolean.TRUE.equals(dd.getValorUnico());
+                            }
+                        });
+                        if (existsKey) {
+                            // Já replicado — nada a fazer
+                            return;
+                        }
+                        if (alvo == null) alvo = fm;
+                    }
+                    if (alvo == null) {
+                        alvo = new FatorMut();
+                        alvo.setTipoMudanca(TipoMudanca.DESMATAMENTO);
+                        alvo.setEscopo(destino);
+                        alvo.setAtivo(true);
+                        alvo.setDadosDesmatamento(new ArrayList<>());
+                    } else if (alvo.getDadosDesmatamento() == null) {
+                        alvo.setDadosDesmatamento(new ArrayList<>());
+                    }
+
+                    DadosDesmatamento ddRep = new DadosDesmatamento();
+                    ddRep.setFatorMut(alvo);
+                    ddRep.setBioma(comum.getBioma());
+                    ddRep.setValorUnico(valorUnico);
+                    ddRep.setUfs(ufs);
+                    // Exclusivos não replicados
+                    ddRep.setNomeFitofisionomia(null);
+                    ddRep.setSiglaFitofisionomia(null);
+                    ddRep.setCategoriaDesmatamento(null);
+                    ddRep.setEstoqueCarbono(null);
+                    ddRep.setFatorCO2(null);
+                    ddRep.setFatorCH4(null);
+                    ddRep.setFatorN2O(null);
+
+                    alvo.getDadosDesmatamento().add(ddRep);
+                    alvo.setDataAtualizacao(LocalDateTime.now());
+                    fatorMutRepository.saveAndFlush(alvo);
+                }
+
+                case VEGETACAO -> {
+                    List<DadosVegetacao> dvOrigList = fonte.getDadosVegetacao() != null ? fonte.getDadosVegetacao() : List.of();
+                    if (dvOrigList.isEmpty()) return;
+
+                    DadosVegetacao comum = dvOrigList.get(0);
+                    String parametro = comum.getParametro();
+                    Set<CategoriaDesmatamento> categorias = comum.getCategoriasFitofisionomia();
+                    if (parametro == null || parametro.trim().isEmpty() || categorias == null || categorias.isEmpty()) return;
+
+                    List<FatorMut> candidatos = fatorMutRepository
+                            .findAllByTipoMudancaAndEscopoAndAtivoTrueOrderByDataAtualizacaoDesc(TipoMudanca.VEGETACAO, destino);
+
+                    FatorMut alvo = null;
+                    for (FatorMut fm : candidatos) {
+                        List<DadosVegetacao> dvList = fm.getDadosVegetacao() != null ? fm.getDadosVegetacao() : List.of();
+                        boolean existsKey = dvList.stream().anyMatch(dv ->
+                                parametro.equals(dv.getParametro()) &&
+                                categorias.equals(dv.getCategoriasFitofisionomia())
+                        );
+                        if (existsKey) {
+                            // Já replicado — nada a fazer
+                            return;
+                        }
+                        if (alvo == null) alvo = fm;
+                    }
+                    if (alvo == null) {
+                        alvo = new FatorMut();
+                        alvo.setTipoMudanca(TipoMudanca.VEGETACAO);
+                        alvo.setEscopo(destino);
+                        alvo.setAtivo(true);
+                        alvo.setDadosVegetacao(new ArrayList<>());
+                    } else if (alvo.getDadosVegetacao() == null) {
+                        alvo.setDadosVegetacao(new ArrayList<>());
+                    }
+
+                    DadosVegetacao dvRep = new DadosVegetacao();
+                    dvRep.setFatorMut(alvo);
+                    dvRep.setParametro(parametro);
+                    dvRep.setCategoriasFitofisionomia(new HashSet<>(categorias));
+                    // Exclusivos não replicados (valores por bioma e fatores)
+                    dvRep.setBioma(null);
+                    dvRep.setValorAmazonia(null);
+                    dvRep.setValorCaatinga(null);
+                    dvRep.setValorCerrado(null);
+                    dvRep.setValorMataAtlantica(null);
+                    dvRep.setValorPampa(null);
+                    dvRep.setValorPantanal(null);
+                    dvRep.setFatorCO2(null);
+                    dvRep.setFatorCH4(null);
+                    dvRep.setFatorN2O(null);
+
+                    alvo.getDadosVegetacao().add(dvRep);
+                    alvo.setDataAtualizacao(LocalDateTime.now());
+                    fatorMutRepository.saveAndFlush(alvo);
+                }
+            }
+        } catch (Exception e) {
+            // Silencioso para não bloquear a operação principal; log para rastreamento
+            log.warn("Falha ao replicar campos comuns para o outro escopo: {}", e.getMessage(), e);
+        }
+    }
+
+
 }

@@ -74,4 +74,7 @@ public class DadosVegetacao {
 
     @Column(name = "biomassa_subterranea", precision = 15, scale = 6)
     private BigDecimal biomassaSubterranea;
+
+    @Column(name = "replicado_automatico", nullable = false)
+    private Boolean replicadoAutomatico = Boolean.FALSE;
 }

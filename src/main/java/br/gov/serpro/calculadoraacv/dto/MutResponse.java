@@ -38,6 +38,7 @@ public class MutResponse {
         private BigDecimal fatorCO2;
         private BigDecimal fatorCH4;
         private BigDecimal fatorN2O;
+        private Boolean replicadoAutomatico;
     }
 
     @Data
@@ -62,6 +63,7 @@ public class MutResponse {
         private BigDecimal alturaMedia;
         private BigDecimal biomassaAerea;
         private BigDecimal biomassaSubterranea;
+        private Boolean replicadoAutomatico;
     }
 
     @Data
@@ -78,5 +80,7 @@ public class MutResponse {
         private String descricao;
         private String usoAnterior;
         private String usoAtual;
+        private Boolean principal;
+        private Boolean replicadoAutomatico;
     }
 }

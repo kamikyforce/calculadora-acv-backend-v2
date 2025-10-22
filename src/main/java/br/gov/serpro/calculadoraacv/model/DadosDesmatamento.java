@@ -58,4 +58,7 @@ public class DadosDesmatamento {
 
     @Column(name = "fator_n2o", precision = 15, scale = 6)
     private BigDecimal fatorN2O;
+
+    @Column(name = "replicado_automatico", nullable = false)
+    private Boolean replicadoAutomatico = Boolean.FALSE;
 }

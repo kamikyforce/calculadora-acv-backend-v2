@@ -44,6 +44,12 @@ public class DadosSolo {
     @Column(name = "uso_atual", length = 255)
     private String usoAtual;
 
+    @Column(name = "principal", nullable = false)
+    private Boolean principal = Boolean.TRUE;
+
+    @Column(name = "replicado_automatico", nullable = false)
+    private Boolean replicadoAutomatico = Boolean.FALSE;
+
     // Getters/Setters explícitos (evita problemas com Lombok)
     public Long getId() { return id; }
     public void setId(Long id) { this.id = id; }
@@ -77,4 +83,10 @@ public class DadosSolo {
 
     public String getUsoAtual() { return usoAtual; }
     public void setUsoAtual(String usoAtual) { this.usoAtual = usoAtual; }
+
+    public Boolean getPrincipal() { return principal; }
+    public void setPrincipal(Boolean principal) { this.principal = principal; }
+
+    public Boolean getReplicadoAutomatico() { return replicadoAutomatico; }
+    public void setReplicadoAutomatico(Boolean replicadoAutomatico) { this.replicadoAutomatico = replicadoAutomatico; }
 }

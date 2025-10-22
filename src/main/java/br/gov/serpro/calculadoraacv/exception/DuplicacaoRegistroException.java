@@ -2,6 +2,7 @@ package br.gov.serpro.calculadoraacv.exception;
 
 public class DuplicacaoRegistroException extends RuntimeException {
     private String codigo;
+    private Long idExistente;
     
     public DuplicacaoRegistroException(String message) {
         super(message);
@@ -13,8 +14,19 @@ public class DuplicacaoRegistroException extends RuntimeException {
         this.codigo = codigo;
     }
     
+    // Novo construtor compatível com uso em MutService: (codigo, mensagem, idExistente)
+    public DuplicacaoRegistroException(String codigo, String mensagem, Long idExistente) {
+        super(mensagem);
+        this.codigo = codigo;
+        this.idExistente = idExistente;
+    }
+
     public String getCodigo() {
         return codigo;
+    }
+
+    public Long getIdExistente() {
+        return idExistente;
     }
     
     // Métodos específicos para diferentes tipos de duplicação
