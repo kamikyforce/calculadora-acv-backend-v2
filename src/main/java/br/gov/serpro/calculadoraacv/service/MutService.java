@@ -112,6 +112,20 @@ public class MutService {
         fatorMut.setDataAtualizacao(LocalDateTime.now());
         try {
             fatorMut = fatorMutRepository.save(fatorMut);
+        } catch (org.springframework.dao.DataIntegrityViolationException ex) {
+            String msg = ex.getMessage();
+            if (msg != null && (msg.contains("ux_desm_ufs_escopo") || msg.contains("ufs_hash"))) {
+                throw new DuplicacaoRegistroException(
+                        "RN008_DUPLICIDADE",
+                        "Já existe registro de Desmatamento com este Bioma e UFs neste escopo.",
+                        null
+                );
+            }
+            throw new DuplicacaoRegistroException(
+                    "DADOS_DUPLICADOS",
+                    "Dados duplicados detectados. Verifique se o registro já existe.",
+                    null
+            );
         } catch (Exception ex) {
             // Tradução para 409 sem consultar o repositório nesta transação
             if (isUniqueConstraintViolation(ex)) {
@@ -158,7 +172,19 @@ public class MutService {
             validarUnicidadeRN008(fatorMut);
 
             fatorMut.setDataAtualizacao(LocalDateTime.now());
-            fatorMut = fatorMutRepository.saveAndFlush(fatorMut);
+            try {
+                fatorMut = fatorMutRepository.saveAndFlush(fatorMut);
+            } catch (DataIntegrityViolationException ex) {
+                String msg = ex.getMessage();
+                if (msg != null && (msg.contains("ux_desm_ufs_escopo") || msg.contains("ufs_hash"))) {
+                    throw new DuplicacaoRegistroException(
+                            "RN008_DUPLICIDADE",
+                            "Já existe registro de Desmatamento com este Bioma e UFs neste escopo.",
+                            null
+                    );
+                }
+                throw ex;
+            }
             log.info("Fator MUT ID {} atualizado", id);
             // Replicação automática dos campos comuns para o outro escopo (ESCOPO1 <-> ESCOPO3)
             replicarCamposComunsParaOutroEscopo(fatorMut);
@@ -166,6 +192,9 @@ public class MutService {
 
         } catch (ValidacaoException e) {
             log.error("Validação falhou ao atualizar MUT {}: {}", id, e.getMessage());
+            throw e;
+        } catch (DuplicacaoRegistroException e) {
+            log.error("Duplicação detectada ao atualizar MUT {}: {}", id, e.getMessage());
             throw e;
         } catch (Exception e) {
             log.error("Erro inesperado ao atualizar MUT {}: {}", id, e.getMessage(), e);

@@ -36,15 +36,15 @@ public class DadosDesmatamento {
     @Column(name = "uf")
     private Set<UF> ufs;
 
-    @Column(name = "nome_fitofisionomia", nullable = false)
+    @Column(name = "nome_fitofisionomia", nullable = true)
     private String nomeFitofisionomia;
 
     @Convert(converter = SiglaFitofisionomiaConverter.class)
-    @Column(name = "sigla_fitofisionomia", nullable = false)
+    @Column(name = "sigla_fitofisionomia", nullable = true)
     private SiglaFitofisionomia siglaFitofisionomia;
 
     @Enumerated(EnumType.STRING)
-    @Column(name = "categoria_desmatamento", nullable = false)
+    @Column(name = "categoria_desmatamento", nullable = true)
     private CategoriaDesmatamento categoriaDesmatamento;
 
     @Column(name = "estoque_carbono", precision = 15, scale = 6)
