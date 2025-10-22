@@ -114,10 +114,10 @@ public class MutService {
             fatorMut = fatorMutRepository.save(fatorMut);
         } catch (org.springframework.dao.DataIntegrityViolationException ex) {
             String msg = ex.getMessage();
-            if (msg != null && (msg.contains("ux_desm_ufs_escopo") || msg.contains("ufs_hash"))) {
+            if (msg != null && (msg.contains("ux_desm_ufs_escopo") || msg.contains("ufs_hash") || msg.contains("ux_desm_valor_unico_escopo"))) {
                 throw new DuplicacaoRegistroException(
                         "RN008_DUPLICIDADE",
-                        "Já existe registro de Desmatamento com este Bioma e UFs neste escopo.",
+                        "Já existe registro de Desmatamento com este Bioma e UFs/Valor Único neste escopo.",
                         null
                 );
             }
@@ -176,11 +176,11 @@ public class MutService {
                 fatorMut = fatorMutRepository.saveAndFlush(fatorMut);
             } catch (DataIntegrityViolationException ex) {
                 String msg = ex.getMessage();
-                if (msg != null && (msg.contains("ux_desm_ufs_escopo") || msg.contains("ufs_hash"))) {
+                if (msg != null && (msg.contains("ux_desm_ufs_escopo") || msg.contains("ufs_hash") || msg.contains("ux_desm_valor_unico_escopo"))) {
                     throw new DuplicacaoRegistroException(
                             "RN008_DUPLICIDADE",
-                            "Já existe registro de Desmatamento com este Bioma e UFs neste escopo.",
-                            null
+                            "Já existe registro de Desmatamento com este Bioma e UFs/Valor Único neste escopo.",
+                            id
                     );
                 }
                 throw ex;
