@@ -998,24 +998,47 @@ public class MutService {
             case SOLO -> {
                 if (fatorMut.getDadosSolo() == null) return;
 
-                // Dentro do MESMO escopo: não pode duplicar combo de uso/tipo
+                // Replicados: tipoFatorSolo + usoAnterior + usoAtual (registro principal: CO2/CH4 nulos)
                 Set<String> chaves = new HashSet<>();
                 for (DadosSolo ds : fatorMut.getDadosSolo()) {
-                    if (ds.getTipoFatorSolo() == null) continue;
+                    String tipo = normalizeTipoFator(ds.getTipoFatorSolo());
+                    String usoAnterior = normalizeNoAccentsLower(ds.getUsoAnterior());
+                    String usoAtual = normalizeNoAccentsLower(ds.getUsoAtual());
 
-                    // Só considera o REGISTRO PRINCIPAL (fator de emissão) na chave replicada:
-                    // LAC (fatorCO2) e Arenoso (fatorCH4) NÃO entram aqui
-                    boolean isRegistroPrincipal = (ds.getFatorCO2() == null && ds.getFatorCH4() == null);
-                    if (isRegistroPrincipal) {
-                        String usoAnterior = safe(ds.getUsoAnterior());
-                        String usoAtual = safe(ds.getUsoAtual());
-                        if (!usoAnterior.isEmpty() && !usoAtual.isEmpty()) {
-                            String key = "SOLO|" + ds.getTipoFatorSolo() + "|" + usoAnterior + "|" + usoAtual;
-                            if (!chaves.add(key)) {
-                                throw new DuplicacaoRegistroException(
-                                        String.format("Já existe fator Solo para %s / %s → %s neste escopo.",
-                                                ds.getTipoFatorSolo(), usoAnterior, usoAtual));
-                            }
+                    // considera só o "principal" para a chave replicativa
+                    if (tipo.isBlank() || usoAnterior.isBlank() || usoAtual.isBlank() || ds.getFatorCO2() != null || ds.getFatorCH4() != null) {
+                        continue;
+                    }
+                    String key = "SOLO|" + tipo + "|" + usoAnterior + "|" + usoAtual;
+                    if (!chaves.add(key)) {
+                        throw new DuplicacaoRegistroException(
+                                String.format("Já existe fator Solo para %s / %s → %s neste escopo.",
+                                        ds.getTipoFatorSolo(), usoAnterior, usoAtual));
+                    }
+
+                    // Checagem replicativa ESTRITA contra o banco, mesmo escopo (evita duplicar entre ESCOPO1/ESCOPO3)
+                    List<FatorMut> candidatos = fatorMutRepository
+                            .findAllByTipoMudancaAndEscopoAndAtivoTrueOrderByDataAtualizacaoDesc(TipoMudanca.SOLO, fatorMut.getEscopo());
+
+                    for (FatorMut fm : candidatos) {
+                        if (fatorMut.getId() != null && Objects.equals(fm.getId(), fatorMut.getId())) {
+                            continue; // ignora o próprio registro durante atualização
+                        }
+                        List<DadosSolo> dsList = fm.getDadosSolo() != null ? fm.getDadosSolo() : List.of();
+                        boolean existeMainEquivalente = dsList.stream().anyMatch(dsBanco -> {
+                            String tipoDs = normalizeTipoFator(dsBanco.getTipoFatorSolo());
+                            String usoAntDs = normalizeNoAccentsLower(dsBanco.getUsoAnterior());
+                            String usoAtDs  = normalizeNoAccentsLower(dsBanco.getUsoAtual());
+                            return tipoDs.equals(tipo)
+                                    && usoAntDs.equals(usoAnterior)
+                                    && usoAtDs.equals(usoAtual)
+                                    && dsBanco.getFatorCO2() == null
+                                    && dsBanco.getFatorCH4() == null;
+                        });
+                        if (existeMainEquivalente) {
+                            throw new DuplicacaoRegistroException(
+                                    String.format("Já existe fator Solo para %s / %s → %s neste escopo.",
+                                            ds.getTipoFatorSolo(), usoAnterior, usoAtual));
                         }
                     }
 
@@ -1398,6 +1421,12 @@ public class MutService {
             // Replicar apenas entre ESCOPO1 e ESCOPO3
             if (fonte.getEscopo() != EscopoEnum.ESCOPO1 && fonte.getEscopo() != EscopoEnum.ESCOPO3) return;
 
+            // Cancelar replicação automática para VEGETAÇÃO
+            if (fonte.getTipoMudanca() == TipoMudanca.VEGETACAO) {
+                log.info("Replicação automática desativada para VEGETACAO.");
+                return;
+            }
+
             EscopoEnum destino = fonte.getEscopo() == EscopoEnum.ESCOPO1 ? EscopoEnum.ESCOPO3 : EscopoEnum.ESCOPO1;
 
             switch (fonte.getTipoMudanca()) {
@@ -1524,62 +1553,6 @@ public class MutService {
                     ddRep.setFatorN2O(null);
 
                     alvo.getDadosDesmatamento().add(ddRep);
-                    alvo.setDataAtualizacao(LocalDateTime.now());
-                    fatorMutRepository.saveAndFlush(alvo);
-                }
-
-                case VEGETACAO -> {
-                    List<DadosVegetacao> dvOrigList = fonte.getDadosVegetacao() != null ? fonte.getDadosVegetacao() : List.of();
-                    if (dvOrigList.isEmpty()) return;
-
-                    DadosVegetacao comum = dvOrigList.get(0);
-                    String parametro = comum.getParametro();
-                    Set<CategoriaDesmatamento> categorias = comum.getCategoriasFitofisionomia();
-                    if (parametro == null || parametro.trim().isEmpty() || categorias == null || categorias.isEmpty()) return;
-
-                    List<FatorMut> candidatos = fatorMutRepository
-                            .findAllByTipoMudancaAndEscopoAndAtivoTrueOrderByDataAtualizacaoDesc(TipoMudanca.VEGETACAO, destino);
-
-                    FatorMut alvo = null;
-                    for (FatorMut fm : candidatos) {
-                        List<DadosVegetacao> dvList = fm.getDadosVegetacao() != null ? fm.getDadosVegetacao() : List.of();
-                        boolean existsKey = dvList.stream().anyMatch(dv ->
-                                parametro.equals(dv.getParametro()) &&
-                                categorias.equals(dv.getCategoriasFitofisionomia())
-                        );
-                        if (existsKey) {
-                            // Já replicado — nada a fazer
-                            return;
-                        }
-                        if (alvo == null) alvo = fm;
-                    }
-                    if (alvo == null) {
-                        alvo = new FatorMut();
-                        alvo.setTipoMudanca(TipoMudanca.VEGETACAO);
-                        alvo.setEscopo(destino);
-                        alvo.setAtivo(true);
-                        alvo.setDadosVegetacao(new ArrayList<>());
-                    } else if (alvo.getDadosVegetacao() == null) {
-                        alvo.setDadosVegetacao(new ArrayList<>());
-                    }
-
-                    DadosVegetacao dvRep = new DadosVegetacao();
-                    dvRep.setFatorMut(alvo);
-                    dvRep.setParametro(parametro);
-                    dvRep.setCategoriasFitofisionomia(new HashSet<>(categorias));
-                    // Exclusivos não replicados (valores por bioma e fatores)
-                    dvRep.setBioma(null);
-                    dvRep.setValorAmazonia(null);
-                    dvRep.setValorCaatinga(null);
-                    dvRep.setValorCerrado(null);
-                    dvRep.setValorMataAtlantica(null);
-                    dvRep.setValorPampa(null);
-                    dvRep.setValorPantanal(null);
-                    dvRep.setFatorCO2(null);
-                    dvRep.setFatorCH4(null);
-                    dvRep.setFatorN2O(null);
-
-                    alvo.getDadosVegetacao().add(dvRep);
                     alvo.setDataAtualizacao(LocalDateTime.now());
                     fatorMutRepository.saveAndFlush(alvo);
                 }
