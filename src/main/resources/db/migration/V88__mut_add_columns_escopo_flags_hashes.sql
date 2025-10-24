@@ -69,26 +69,4 @@ ALTER TABLE dados_solo         ALTER COLUMN escopo SET NOT NULL;
 ALTER TABLE dados_desmatamento ALTER COLUMN escopo SET NOT NULL;
 ALTER TABLE dados_vegetacao    ALTER COLUMN escopo SET NOT NULL;
 
--- ===== ÍNDICES ÚNICOS POR ESCOPO =====
--- SOLO: chave comum por escopo (principal)
-CREATE UNIQUE INDEX IF NOT EXISTS ux_solo_chave_comum_escopo
-  ON dados_solo (escopo, tipo_fator_solo, uso_anterior, uso_atual)
-  WHERE principal = TRUE
-    AND uso_anterior IS NOT NULL
-    AND uso_atual IS NOT NULL;
-
--- DESMATAMENTO: bioma + valor_unico por escopo
-CREATE UNIQUE INDEX IF NOT EXISTS ux_desm_valor_unico_escopo
-  ON dados_desmatamento (escopo, bioma)
-  WHERE valor_unico = TRUE;
-
--- DESMATAMENTO: bioma + ufs_hash por escopo (quando não valor_unico)
-CREATE UNIQUE INDEX IF NOT EXISTS ux_desm_ufs_escopo
-  ON dados_desmatamento (escopo, bioma, ufs_hash)
-  WHERE COALESCE(valor_unico, FALSE) = FALSE;
-
--- VEGETAÇÃO: categorias + parâmetro por escopo
-CREATE UNIQUE INDEX IF NOT EXISTS ux_veg_categoria_param_escopo
-  ON dados_vegetacao (escopo, categorias_hash, parametro);
-
 COMMIT;
