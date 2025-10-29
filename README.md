@@ -3,7 +3,7 @@ Calculadora ACV
 
 
 ## 💻 Executando em desenvolvimento
-Para iniciar o servidor de desenvolvimento local, execute:
+Para iniciar o servidor de desenvolvimento local, execute!
 
 ```bash
 ./mvnw spring-boot:run

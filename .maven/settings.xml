@@ -1,0 +1,18 @@
+<settings>
+  <mirrors>
+    <mirror>
+      <id>nexus.sub</id>
+      <name>nexus.sub</name>
+      <url>${NEXUS_URL}</url>
+      <!--  Exemplo: <url>https://nexus.ext.serpro.gov.br/repository/sub-nnnnn-maven-public</url>  -->
+      <mirrorOf>*</mirrorOf>
+    </mirror>
+  </mirrors>
+  <servers>
+  <server>
+    <id>nexus.sub</id>
+    <username>${NEXUS_USUARIO}</username>
+    <password>${NEXUS_SENHA}</password>
+  </server>
+  </servers>
+</settings>

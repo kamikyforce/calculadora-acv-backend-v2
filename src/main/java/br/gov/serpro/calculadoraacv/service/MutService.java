@@ -29,6 +29,7 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.annotation.Propagation;
 
 import java.util.Arrays;
 import org.springframework.web.multipart.MultipartFile;
@@ -57,6 +58,9 @@ public class MutService {
     @Transactional
     public MutResponse criar(MutRequest request, Usuario usuario) {
         validarDadosMut(request);
+
+        // === DESMATAMENTO — pre-check duplicidade (como no SOLO) e devolver idExistente ===
+        verificarDuplicidadeDesmatamentoComIdExistente(request);
 
         // ===== Opção 1: bloquear duplicidade Solo pelo par usoAnterior/usoAtual e devolver idExistente no 409 =====
         try {
@@ -177,10 +181,12 @@ public class MutService {
             } catch (DataIntegrityViolationException ex) {
                 String msg = ex.getMessage();
                 if (msg != null && (msg.contains("ux_desm_ufs_escopo") || msg.contains("ufs_hash") || msg.contains("ux_desm_valor_unico_escopo"))) {
+                    // === DESMATAMENTO — devolve idExistente do registro que colide, e não o id atual ===
+                    Long idExistente = buscarIdExistenteDesmatamentoKey(request, id);
                     throw new DuplicacaoRegistroException(
                             "RN008_DUPLICIDADE",
                             "Já existe registro de Desmatamento com este Bioma e UFs/Valor Único neste escopo.",
-                            id
+                            idExistente != null ? idExistente : id
                     );
                 }
                 throw ex;
@@ -1303,6 +1309,54 @@ public class MutService {
         }
     }
 
+    // ===== Helpers DESMATAMENTO — igual ao SOLO, agora com idExistente =====
+    private void verificarDuplicidadeDesmatamentoComIdExistente(MutRequest request) {
+        if (request == null || request.getTipoMudanca() != TipoMudanca.DESMATAMENTO) return;
+        if (request.getEscopo() == null || request.getDadosDesmatamento() == null || request.getDadosDesmatamento().isEmpty()) return;
+
+        Long idExistente = buscarIdExistenteDesmatamentoKey(request, null);
+        if (idExistente != null) {
+            throw new DuplicacaoRegistroException(
+                    "RN008_DUPLICIDADE",
+                    "Já existe registro de Desmatamento com este Bioma e UFs/Valor Único neste escopo.",
+                    idExistente
+            );
+        }
+    }
+
+    private Long buscarIdExistenteDesmatamentoKey(MutRequest request, Long excluirId) {
+        if (request == null || request.getTipoMudanca() != TipoMudanca.DESMATAMENTO) return null;
+        if (request.getEscopo() == null || request.getDadosDesmatamento() == null || request.getDadosDesmatamento().isEmpty()) return null;
+
+        MutRequest.DadosDesmatamentoRequest d = request.getDadosDesmatamento().get(0);
+        Bioma bioma = d.getBioma();
+        Boolean valorUnico = d.getValorUnico();
+        Set<UF> ufsReq = d.getUfs() != null ? d.getUfs() : Set.of();
+
+        List<FatorMut> candidatos = fatorMutRepository
+                .findAllByTipoMudancaAndEscopoAndAtivoTrueOrderByDataAtualizacaoDesc(TipoMudanca.DESMATAMENTO, request.getEscopo());
+
+        for (FatorMut fm : candidatos) {
+            if (excluirId != null && Objects.equals(fm.getId(), excluirId)) continue;
+            List<DadosDesmatamento> ddList = fm.getDadosDesmatamento() != null ? fm.getDadosDesmatamento() : List.of();
+
+            boolean existsKey = ddList.stream().anyMatch(dd -> {
+                if (dd.getBioma() != bioma) return false;
+                if (Boolean.TRUE.equals(valorUnico)) {
+                    return Boolean.TRUE.equals(dd.getValorUnico());
+                } else {
+                    Set<UF> uBanco = dd.getUfs() != null ? dd.getUfs() : Set.of();
+                    return !Boolean.TRUE.equals(dd.getValorUnico()) && uBanco.equals(ufsReq);
+                }
+            });
+
+            if (existsKey) {
+                return fm.getId();
+            }
+        }
+        return null;
+    }
+
     // Normaliza USO_ANTERIOR_ATUAL e SOLO_USO_ANTERIOR_ATUAL como equivalentes
     private String normalizeTipoFator(TipoFatorSolo tipo) {
         String raw = tipo == null ? "" : tipo.name();
@@ -1415,6 +1469,7 @@ public class MutService {
         return isUniqueConstraintViolation(ex.getCause());
     }
 
+    @Transactional(propagation = Propagation.REQUIRES_NEW, noRollbackFor = DataIntegrityViolationException.class)
     private void replicarCamposComunsParaOutroEscopo(FatorMut fonte) {
         try {
             if (fonte == null || fonte.getEscopo() == null || fonte.getTipoMudanca() == null) return;
@@ -1424,6 +1479,12 @@ public class MutService {
             // Cancelar replicação automática para VEGETAÇÃO
             if (fonte.getTipoMudanca() == TipoMudanca.VEGETACAO) {
                 log.info("Replicação automática desativada para VEGETACAO.");
+                return;
+            }
+
+            // Cancelar replicação automática para DESMATAMENTO (evita 500 por ux_desm_ufs_escopo)
+            if (fonte.getTipoMudanca() == TipoMudanca.DESMATAMENTO) {
+                log.info("Replicação automática desativada para DESMATAMENTO.");
                 return;
             }
 
@@ -1493,66 +1554,6 @@ public class MutService {
                     dsRep.setReplicadoAutomatico(Boolean.TRUE);
 
                     alvo.getDadosSolo().add(dsRep);
-                    alvo.setDataAtualizacao(LocalDateTime.now());
-                    fatorMutRepository.saveAndFlush(alvo);
-                }
-
-                case DESMATAMENTO -> {
-                    List<DadosDesmatamento> ddOrigList = fonte.getDadosDesmatamento() != null ? fonte.getDadosDesmatamento() : List.of();
-                    if (ddOrigList.isEmpty()) return;
-
-                    DadosDesmatamento comum = ddOrigList.get(0); // chave replicativa por escopo
-                    if (comum.getBioma() == null) return;
-                    Boolean valorUnico = comum.getValorUnico();
-                    Set<UF> ufs = comum.getUfs();
-
-                    List<FatorMut> candidatos = fatorMutRepository
-                            .findAllByTipoMudancaAndEscopoAndAtivoTrueOrderByDataAtualizacaoDesc(TipoMudanca.DESMATAMENTO, destino);
-
-                    FatorMut alvo = null;
-                    for (FatorMut fm : candidatos) {
-                        List<DadosDesmatamento> ddList = fm.getDadosDesmatamento() != null ? fm.getDadosDesmatamento() : List.of();
-                        boolean existsKey = ddList.stream().anyMatch(dd -> {
-                            if (dd.getBioma() != comum.getBioma()) return false;
-                            if (Boolean.TRUE.equals(valorUnico)) {
-                                return Boolean.TRUE.equals(dd.getValorUnico());
-                            } else {
-                                Set<UF> u = dd.getUfs() != null ? dd.getUfs() : Set.of();
-                                Set<UF> v = ufs != null ? ufs : Set.of();
-                                return u.equals(v) && !Boolean.TRUE.equals(dd.getValorUnico());
-                            }
-                        });
-                        if (existsKey) {
-                            // Já replicado — nada a fazer
-                            return;
-                        }
-                        if (alvo == null) alvo = fm;
-                    }
-                    if (alvo == null) {
-                        alvo = new FatorMut();
-                        alvo.setTipoMudanca(TipoMudanca.DESMATAMENTO);
-                        alvo.setEscopo(destino);
-                        alvo.setAtivo(true);
-                        alvo.setDadosDesmatamento(new ArrayList<>());
-                    } else if (alvo.getDadosDesmatamento() == null) {
-                        alvo.setDadosDesmatamento(new ArrayList<>());
-                    }
-
-                    DadosDesmatamento ddRep = new DadosDesmatamento();
-                    ddRep.setFatorMut(alvo);
-                    ddRep.setBioma(comum.getBioma());
-                    ddRep.setValorUnico(valorUnico);
-                    ddRep.setUfs(ufs);
-                    // Exclusivos não replicados
-                    ddRep.setNomeFitofisionomia(null);
-                    ddRep.setSiglaFitofisionomia(null);
-                    ddRep.setCategoriaDesmatamento(null);
-                    ddRep.setEstoqueCarbono(null);
-                    ddRep.setFatorCO2(null);
-                    ddRep.setFatorCH4(null);
-                    ddRep.setFatorN2O(null);
-
-                    alvo.getDadosDesmatamento().add(ddRep);
                     alvo.setDataAtualizacao(LocalDateTime.now());
                     fatorMutRepository.saveAndFlush(alvo);
                 }

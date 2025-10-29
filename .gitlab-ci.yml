@@ -1,0 +1,108 @@
+include:
+  - remote: "https://git.serpro/devops/automacao/gitlab-ci/raw/master/.estaleiro-client.yml"
+  # - remote: "https://git.serpro/devops/automacao/gitlab-ci/raw/master/.coleta.yml"
+  - remote: "https://git.serpro/devops/automacao/gitlab-ci/raw/master/.sonar-scanner.yml"
+  #- remote: 'https://git.serpro/devops/automacao/gitlab-ci/raw/master/.smoke-test.yml'
+  - remote: "https://git.serpro/devops/automacao/gitlab-ci/raw/master/.dependency-track.yml"
+  # - template: Security/SAST.gitlab-ci.yml
+
+variables:
+  GIT_SSL_NO_VERIFY: "true"
+  ESTALEIRO_ENDPOINT: https://console.estaleiro.serpro.gov.br
+  ESTALEIRO_TOKEN: $TOKEN_ESTALEIRO
+  ESTALEIRO_SYSTEM: calculadora-acv
+  ESTALEIRO_MODULE: calculadora-acv-backend
+  ESTALEIRO_PLATFORM: java:21-openjdk-debian
+
+stages:
+  - Compilação
+  - Testes
+  # - Dependency Track
+  - Build
+  - Publicação
+
+compilacao:
+  stage: Compilação
+  image: hub.estaleiro.serpro/pipeline/maven:3-openjdk-21
+  script:
+    - echo "Compilando aplicação"
+    - mkdir -p ~/.m2 && cp .maven/settings.xml ~/.m2/settings.xml
+    - mvn clean package
+  artifacts:
+    paths:
+      - estaleiro
+      - target
+    expire_in: 1 hour
+  allow_failure: false
+
+testes:
+  stage: Testes
+  image: hub.estaleiro.serpro/pipeline/maven:3-openjdk-21
+  dependencies:
+    - compilacao
+  script:
+    - mkdir -p ~/.m2 && cp .maven/settings.xml ~/.m2/settings.xml
+    - mvn clean verify
+  artifacts:
+    paths:
+      - target/site/jacoco/
+    expire_in: 1 day
+  allow_failure: false
+  when: on_success
+
+# dependency-track:
+#   stage: Dependency Track
+#   extends: .dependency-track-maven-plugin-3-jdk-21
+#   before_script:
+#     - echo "Executando etapa de Dependency Track"
+#     - mkdir -p ~/.m2 && cp .maven/settings.xml ~/.m2/settings.xml
+#     - ls -la
+#   only:
+#     - main
+
+app-build:
+  stage: Build
+  extends: .estaleiro-build
+  dependencies:
+    - compilacao
+  before_script:
+    - cp -r target/calculadoraacv-1.0.0.jar estaleiro
+    - cd estaleiro
+    - ls -al
+  variables:
+    EST_TOKEN: $ESTALEIRO_TOKEN
+    EST_SYSTEM: $ESTALEIRO_SYSTEM
+    EST_MODULE: $ESTALEIRO_MODULE
+    EST_PLATFORM: $ESTALEIRO_PLATFORM
+    EST_VERSION: $CI_PIPELINE_ID
+  allow_failure: false
+  when: on_success
+
+publicacao-des:
+  stage: Publicação
+  extends: .estaleiro-publish
+  dependencies:
+    - app-build
+  variables:
+    EST_ENVIRONMENT: "des"
+    EST_TOKEN: $ESTALEIRO_TOKEN
+    EST_SYSTEM: $ESTALEIRO_SYSTEM
+    EST_MODULE: $ESTALEIRO_MODULE
+    EST_PLATFORM: $ESTALEIRO_PLATFORM
+    EST_VERSION: $CI_PIPELINE_ID
+  when: manual
+
+publicacao-tes:
+  stage: Publicação
+  extends: .estaleiro-publish
+  dependencies:
+    - app-build
+  variables:
+    EST_ENVIRONMENT: "tes"
+    EST_TOKEN: $ESTALEIRO_TOKEN
+    EST_SYSTEM: $ESTALEIRO_SYSTEM
+    EST_MODULE: $ESTALEIRO_MODULE
+    EST_PLATFORM: $ESTALEIRO_PLATFORM
+    EST_VERSION: $CI_PIPELINE_ID
+  when: manual
+
